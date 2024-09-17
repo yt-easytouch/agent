@@ -92,11 +92,22 @@ class Base:
             shell=True,
             executable=executable,
         ) as process:
+            # if input:
+            #     process._stdin_write(input.encode())
             if input:
-                process._stdin_write(input.encode())
+                try:
+                    process.stdin.write(input.encode())
+                    process.stdin.close()  # Ensure input stream is closed after writing
+                except BrokenPipeError:
+                    # Handle broken pipe error
+                    self.data.update({"status": "Failure", "traceback": "BrokenPipeError occurred"})
+                    self.log()
+                    raise
+                
 
             output = self.parse_output(process)
-            returncode = process.poll() or 0
+            returncode = process.wait()  # Wait for the process to complete
+            #returncode = process.poll() or 0
             # This is equivalent of check=True
             # Raise an exception if the process returns a non-zero return code
             if non_zero_throw and returncode:
