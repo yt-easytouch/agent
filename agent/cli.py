@@ -58,7 +58,7 @@ def ping_server(password: str):
 @click.option("--name", required=True)
 @click.option("--user", default="frappe")
 @click.option("--workers", required=True, type=int)
-@click.option("--proxy-ip", required=False, type=str)
+@click.option("--proxy-ip", required=False, type=str, default=None)
 @click.option("--sentry-dsn", required=False, type=str)
 def config(name, user, workers, proxy_ip=None, sentry_dsn=None):
     config = {
@@ -147,7 +147,7 @@ def site_analytics():
     stderr = os.path.join(logs_directory, "analytics.error.log")
 
     cron = CronTab(user=True)
-    command = f"cd {agent_directory} && {sys.executable} {script}" f" 1>> {stdout} 2>> {stderr}"
+    command = f"cd {agent_directory} && {sys.executable} {script} 1>> {stdout} 2>> {stderr}"
 
     if command in str(cron):
         cron.remove_all(command=command)
@@ -170,7 +170,7 @@ def usage():
     stderr = os.path.join(logs_directory, "usage.error.log")
 
     cron = CronTab(user=True)
-    command = f"cd {agent_directory} && {sys.executable} {script}" f" 1>> {stdout} 2>> {stderr}"
+    command = f"cd {agent_directory} && {sys.executable} {script} 1>> {stdout} 2>> {stderr}"
 
     if command not in str(cron):
         job = cron.new(command=command)

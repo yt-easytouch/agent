@@ -12,11 +12,19 @@ from typing import TYPE_CHECKING
 from flask import Flask, Response, jsonify, request
 from passlib.hash import pbkdf2_sha256 as pbkdf2
 from playhouse.shortcuts import model_to_dict
+from redis.exceptions import ConnectionError as RedisConnectionError
+from rq.exceptions import NoSuchJobError
+from rq.job import Job as RQJob
+from rq.job import JobStatus
 
+from agent.base import AgentException
 from agent.builder import ImageBuilder, get_image_build_context_directory
 from agent.database import JSONEncoderForSQLQueryResult
+from agent.database_physical_backup import DatabasePhysicalBackup
+from agent.database_physical_restore import DatabasePhysicalRestore
 from agent.database_server import DatabaseServer
 from agent.exceptions import BenchNotExistsException, SiteNotExistsException
+from agent.job import Job as AgentJob
 from agent.job import JobModel, connection
 from agent.minio import Minio
 from agent.monitor import Monitor
@@ -79,6 +87,10 @@ log.handlers = []
 
 @application.before_request
 def validate_access_token():
+    exempt_endpoints = ["get_metrics"]
+    if request.endpoint in exempt_endpoints:
+        return None
+
     try:
         if application.debug:
             return None
@@ -178,6 +190,7 @@ def build_image():
         no_cache=data.get("no_cache"),
         no_push=data.get("no_push"),
         registry=data.get("registry"),
+        platform=data.get("platform", "linux/amd64"),
     )
     job = image_builder.run_remote_builder()
     return {"job": job}
@@ -217,10 +230,52 @@ def get_benches():
     return {name: bench.dump() for name, bench in Server().benches.items()}
 
 
+@application.route("/benches/metrics")
+def get_metrics():
+    from agent.exporter import get_metrics
+
+    benches_metrics = []
+    server = Server()
+
+    for name, bench in server.benches.items():
+        rq_port = bench.bench_config.get("rq_port")
+        if rq_port is not None:
+            try:
+                metrics = get_metrics(name, rq_port)
+                benches_metrics.append(metrics)
+            except RedisConnectionError as e:
+                # This is to specifically catch the error on old benches that had their
+                # configs updated to render rq_port but the container doesn't actually
+                # expose the rq_port
+                log.error(f"Failed to get metrics for {name} on port {rq_port}: {e}")
+
+    return Response(benches_metrics, mimetype="text/plain")
+
+
 @application.route("/benches/<string:bench>")
 @validate_bench
 def get_bench(bench):
     return Server().benches[bench].dump()
+
+
+@application.route("/benches/<string:bench_str>/metrics", methods=["GET"])
+def get_bench_metrics(bench_str):
+    from agent.exporter import get_metrics
+
+    bench = Server().benches[bench_str]
+    rq_port = bench.bench_config.get("rq_port")
+    if rq_port:
+        try:
+            res = get_metrics(bench_str, rq_port)
+        except RedisConnectionError as e:
+            # This is to specifically catch the error on old benches that had their
+            # configs updated to render rq_port but the container doesn't actually
+            # expose the rq_port
+            log.error(f"Failed to get metrics for {bench_str} on port {rq_port}: {e}")
+        else:
+            return Response(res, mimetype="text/plain")
+
+    return Response("Unavailable", status=400, mimetype="text/plain")
 
 
 @application.route("/benches/<string:bench>/info", methods=["POST", "GET"])
@@ -550,14 +605,31 @@ def backup_site(bench, site):
     return {"job": job}
 
 
-@application.route("/benches/<string:bench>/sites/<string:site>/database/schema", methods=["POST"])
+@application.route(
+    "/benches/<string:bench>/sites/<string:site>/database/schema",
+    methods=["POST"],
+)
 @validate_bench_and_site
 def fetch_database_table_schema(bench, site):
-    job = Server().benches[bench].sites[site].fetch_database_table_schema()
+    data = request.json or {}
+    include_table_size = data.get("include_table_size", False)
+    include_index_info = data.get("include_index_info", False)
+    job = (
+        Server()
+        .benches[bench]
+        .sites[site]
+        .fetch_database_table_schema(
+            include_table_size=include_table_size,
+            include_index_info=include_index_info,
+        )
+    )
     return {"job": job}
 
 
-@application.route("/benches/<string:bench>/sites/<string:site>/database/query/execute", methods=["POST"])
+@application.route(
+    "/benches/<string:bench>/sites/<string:site>/database/query/execute",
+    methods=["POST"],
+)
 @validate_bench_and_site
 def run_sql(bench, site):
     query = request.json.get("query")
@@ -570,6 +642,94 @@ def run_sql(bench, site):
         ),
         mimetype="application/json",
     )
+
+
+@application.route(
+    "/benches/<string:bench>/sites/<string:site>/database/analyze-slow-queries", methods=["POST"]
+)
+@validate_bench_and_site
+def analyze_slow_queries(bench: str, site: str):
+    queries = request.json["queries"]
+    mariadb_root_password = request.json["mariadb_root_password"]
+
+    job = Server().benches[bench].sites[site].analyze_slow_queries_job(queries, mariadb_root_password)
+    return {"job": job}
+
+
+@application.route(
+    "/benches/<string:bench>/sites/<string:site>/database/performance-report", methods=["POST"]
+)
+def database_performance_report(bench, site):
+    data = request.json
+    result = (
+        Server()
+        .benches[bench]
+        .sites[site]
+        .fetch_summarized_database_performance_report(data["mariadb_root_password"])
+    )
+    return jsonify(json.loads(json.dumps(result, cls=JSONEncoderForSQLQueryResult)))
+
+
+@application.route("/benches/<string:bench>/sites/<string:site>/database/processes", methods=["GET", "POST"])
+def database_process_list(bench, site):
+    data = request.json
+    return jsonify(
+        Server().benches[bench].sites[site].fetch_database_process_list(data["mariadb_root_password"])
+    )
+
+
+@application.route(
+    "/benches/<string:bench>/sites/<string:site>/database/kill-process/<string:pid>", methods=["GET", "POST"]
+)
+def database_kill_process(bench, site, pid):
+    data = request.json
+    Server().benches[bench].sites[site].kill_database_process(pid, data["mariadb_root_password"])
+    return {}
+
+
+@application.route("/benches/<string:bench>/sites/<string:site>/database/users", methods=["POST"])
+@validate_bench_and_site
+def create_database_user(bench, site):
+    data = request.json
+    job = (
+        Server()
+        .benches[bench]
+        .sites[site]
+        .create_database_user_job(data["username"], data["password"], data["mariadb_root_password"])
+    )
+    return {"job": job}
+
+
+@application.route(
+    "/benches/<string:bench>/sites/<string:site>/database/users/<string:db_user>",
+    methods=["DELETE"],
+)
+@validate_bench_and_site
+def remove_database_user(bench, site, db_user):
+    data = request.json
+    job = Server().benches[bench].sites[site].remove_database_user_job(db_user, data["mariadb_root_password"])
+    return {"job": job}
+
+
+@application.route(
+    "/benches/<string:bench>/sites/<string:site>/database/users/<string:db_user>/permissions",
+    methods=["POST"],
+)
+@validate_bench_and_site
+def update_database_permissions(bench, site, db_user):
+    data = request.json
+    job = (
+        Server()
+        .benches[bench]
+        .sites[site]
+        .modify_database_user_permissions_job(
+            db_user,
+            data["mode"],
+            data.get("permissions", {}),
+            data["mariadb_root_password"],
+        )
+    )
+    return {"job": job}
 
 
 @application.route(
@@ -598,6 +758,25 @@ def migrate_site(bench, site):
 @validate_bench_and_site
 def clear_site_cache(bench, site):
     job = Server().benches[bench].sites[site].clear_cache_job()
+    return {"job": job}
+
+
+@application.route(
+    "/benches/<string:bench>/sites/<string:site>/activate",
+    methods=["POST"],
+)
+@validate_bench_and_site
+def activate_site(bench, site):
+    job = Server().activate_site_job(site, bench)
+    return {"job": job}
+
+
+@application.route(
+    "/benches/<string:bench>/sites/<string:site>/deactivate",
+    methods=["POST"],
+)
+def deactivate_site(bench, site):
+    job = Server().deactivate_site_job(site, bench)
     return {"job": job}
 
 
@@ -642,6 +821,7 @@ def update_site_recover_migrate(bench, site):
         data["target"],
         data.get("activate", True),
         data.get("rollback_scripts", {}),
+        data.get("restore_touched_tables", True),
     )
     return {"job": job}
 
@@ -857,6 +1037,13 @@ def proxy_add_upstream_site(upstream):
     return {"job": job}
 
 
+@application.route("/proxy/upstreams/<string:upstream>/domains", methods=["POST"])
+def proxy_add_upstream_site_domain(upstream):
+    data = request.json
+    job = Proxy().add_domain_to_upstream_job(upstream, data["domain"], data.get("skip_reload", False))
+    return {"job": job}
+
+
 @application.route(
     "/proxy/upstreams/<string:upstream>/sites/<string:site>",
     methods=["DELETE"],
@@ -899,6 +1086,37 @@ def update_monitor_rules():
     Monitor().update_rules(data["rules"])
     Monitor().update_routes(data["routes"])
     return {}
+
+
+@application.route("/database/physical-backup", methods=["POST"])
+def physical_backup_database():
+    data = request.json
+    job = DatabasePhysicalBackup(
+        databases=data["databases"],
+        db_user="root",
+        db_host=data["private_ip"],
+        db_password=data["mariadb_root_password"],
+        site_backup_name=data["site_backup"]["name"],
+        snapshot_trigger_url=data["site_backup"]["snapshot_trigger_url"],
+        snapshot_request_key=data["site_backup"]["snapshot_request_key"],
+    ).create_backup_job()
+    return {"job": job}
+
+
+@application.route("/database/physical-restore", methods=["POST"])
+def physical_restore_database():
+    data = request.json
+    job = DatabasePhysicalRestore(
+        backup_db=data["backup_db"],
+        target_db=data["target_db"],
+        target_db_root_password=data["target_db_root_password"],
+        target_db_port=3306,
+        target_db_host=data["private_ip"],
+        backup_db_base_directory=data.get("backup_db_base_directory", ""),
+        restore_specific_tables=data.get("restore_specific_tables", False),
+        tables_to_restore=data.get("tables_to_restore", []),
+    ).create_restore_job()
+    return {"job": job}
 
 
 @application.route("/database/binary/logs")
@@ -955,13 +1173,15 @@ def get_database_deadlocks():
     return jsonify(DatabaseServer().get_deadlocks(**data))
 
 
+# TODO can be removed
 @application.route("/database/column-stats", methods=["POST"])
 def fetch_column_statistics():
     data = request.json
-    job = DatabaseServer().fetch_column_stats(**data)
+    job = DatabaseServer().fetch_column_stats_job(**data)
     return {"job": job}
 
 
+# TODO can be removed
 @application.route("/database/explain", methods=["POST"])
 def explain():
     data = request.json
@@ -995,6 +1215,7 @@ def proxysql_add_user():
         data["username"],
         data["password"],
         data["database"],
+        data["max_connections"],
         data["backend"],
     )
     return {"job": job}
@@ -1014,10 +1235,38 @@ def proxysql_remove_user(username):
     return {"job": job}
 
 
+def get_status_from_rq(job, redis):
+    RQ_STATUS_MAP = {
+        JobStatus.QUEUED: "Pending",
+        JobStatus.FINISHED: "Success",
+        JobStatus.FAILED: "Failure",
+        JobStatus.STARTED: "Running",
+        JobStatus.DEFERRED: "Pending",
+        JobStatus.SCHEDULED: "Pending",
+        JobStatus.STOPPED: "Failure",
+        JobStatus.CANCELED: "Failure",
+    }
+    status = None
+    try:
+        rq_status = RQJob.fetch(str(job["id"]), connection=redis).get_status()
+        status = RQ_STATUS_MAP.get(rq_status)
+    except NoSuchJobError:
+        # Handle jobs enqueued before we started setting job_id
+        pass
+    return status
+
+
 def to_dict(model):
     redis = connection()
     if isinstance(model, JobModel):
         job = model_to_dict(model, backrefs=True)
+        status_from_rq = get_status_from_rq(job, redis)
+        if status_from_rq:
+            # Override status from JobModel if rq says the job is already ended
+            TERMINAL_STATUSES = ["Success", "Failure"]
+            if job["status"] not in TERMINAL_STATUSES and status_from_rq in TERMINAL_STATUSES:
+                job["status"] = status_from_rq
+
         job["data"] = json.loads(job["data"]) or {}
         job_key = f"agent:job:{job['id']}"
         job["commands"] = [json.loads(command) for command in redis.lrange(job_key, 0, -1)]
@@ -1053,6 +1302,14 @@ def jobs(id=None, ids=None, status=None):
     else:
         data = get_jobs(limit=100)
 
+    return jsonify(json.loads(json.dumps(data, default=str)))
+
+
+@application.route("/jobs/<int:id>/cancel", methods=["POST"])
+def cancel_job(id=None):
+    job = AgentJob(id=id)
+    job.cancel_or_stop()
+    data = to_dict(job.model)
     return jsonify(json.loads(json.dumps(data, default=str)))
 
 
@@ -1233,6 +1490,8 @@ def all_exception_handler(error):
         capture_exception(error)
     except ImportError:
         pass
+    if isinstance(error, AgentException):
+        return json.loads(json.dumps(error.data, default=str)), 500
     return {"error": "".join(traceback.format_exception(*sys.exc_info())).splitlines()}, 500
 
 
@@ -1277,7 +1536,10 @@ def site_not_found(e):
 
 @application.route("/docker_cache_utils/<string:method>", methods=["POST"])
 def docker_cache_utils(method: str):
-    from agent.docker_cache_utils import get_cached_apps, run_command_in_docker_cache
+    from agent.docker_cache_utils import (
+        get_cached_apps,
+        run_command_in_docker_cache,
+    )
 
     if method == "run_command_in_docker_cache":
         return run_command_in_docker_cache(**request.json)

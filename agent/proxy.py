@@ -70,13 +70,29 @@ class Proxy(Server):
             if wildcard.get("code_server"):
                 Path(os.path.join(host_directory, "codeserver")).touch()
 
-    @job("Add Site to Upstream")
-    def add_site_to_upstream_job(self, upstream, site, skip_reload=False):
+    def add_site_domain_to_upstream(self, upstream, site, skip_reload=False):
+        self.remove_conflicting_site(site)
         self.add_site_to_upstream(upstream, site)
         self.generate_proxy_config()
         if skip_reload:
             return
         self.reload_nginx()
+
+    @job("Add Site to Upstream")
+    def add_site_to_upstream_job(self, upstream, site, skip_reload=False):
+        self.add_site_domain_to_upstream(upstream, site, skip_reload)
+
+    @job("Add Domain to Upstream")
+    def add_domain_to_upstream_job(self, upstream, domain, skip_reload=False):
+        self.add_site_domain_to_upstream(upstream, domain, skip_reload)
+
+    @step("Remove Conflicting Site")
+    def remove_conflicting_site(self, site):
+        # Go through all upstreams and remove the site file matching the site name
+        for upstream in self.upstreams:
+            conflict = os.path.join(self.upstreams_directory, upstream, site)
+            if os.path.exists(conflict):
+                os.remove(conflict)
 
     @step("Add Site File to Upstream Directory")
     def add_site_to_upstream(self, upstream, site):
@@ -144,6 +160,7 @@ class Proxy(Server):
         new_name: str,
         skip_reload=False,
     ):
+        self.remove_conflicting_site(new_name)
         self.rename_site_on_upstream(upstream, site, new_name)
         site_host_dir = os.path.join(self.hosts_directory, site)
         if os.path.exists(site_host_dir):

@@ -14,7 +14,7 @@ import requests
 from agent.base import AgentException, Base
 from agent.database import Database
 from agent.job import job, step
-from agent.utils import b2mb, get_size
+from agent.utils import b2mb, compute_file_hash, get_size
 
 if TYPE_CHECKING:
     from agent.bench import Bench
@@ -129,6 +129,26 @@ class Site(Base):
         finally:
             self.bench.drop_mariadb_user(self.name, mariadb_root_password, self.database)
 
+    @step("Checksum of Downloaded Backup Files")
+    def calculate_checksum_of_backup_files(self, database_file, public_file, private_file):
+        database_file_sha256 = compute_file_hash(database_file, algorithm="sha256", raise_exception=False)
+
+        data = f"""Database File
+> File Name - {os.path.basename(database_file)}
+> SHA256 Checksum - {database_file_sha256}\n"""
+        if public_file:
+            public_file_sha256 = compute_file_hash(public_file, algorithm="sha256", raise_exception=False)
+            data += f"""\nPublic File
+> File Name - {os.path.basename(public_file)}
+> SHA256 Checksum - {public_file_sha256}\n"""
+        if private_file:
+            private_file_sha256 = compute_file_hash(private_file, algorithm="sha256", raise_exception=False)
+            data += f"""\nPrivate File
+> File Name - {os.path.basename(private_file)}
+> SHA256 Checksum - {private_file_sha256}\n"""
+
+        return {"output": data}
+
     @job("Restore Site")
     def restore_job(
         self,
@@ -149,6 +169,9 @@ class Site(Base):
                 files["public"],
                 files["private"],
             )
+        except Exception:
+            self.calculate_checksum_of_backup_files(files["database"], files["public"], files["private"])
+            raise
         finally:
             self.bench.delete_downloaded_files(files["directory"])
         self.uninstall_unavailable_apps(apps)
@@ -250,7 +273,7 @@ class Site(Base):
             "FLUSH PRIVILEGES",
         ]
         for query in queries:
-            command = f"mysql -h {self.host} -uroot -p{mariadb_root_password}" f' -e "{query}"'
+            command = f'mysql -h {self.host} -uroot -p{mariadb_root_password} -e "{query}"'
             self.execute(command)
         return {"database": database, "user": user, "password": password}
 
@@ -258,13 +281,45 @@ class Site(Base):
         if user == self.user:
             # Do not revoke access for the main user
             return {}
-        queries = [
-            f"DROP USER IF EXISTS '{user}'@'%'",
-            "FLUSH PRIVILEGES",
-        ]
-        for query in queries:
-            command = f"mysql -h {self.host} -uroot -p{mariadb_root_password}" f' -e "{query}"'
-            self.execute(command)
+        self.db_instance("root", mariadb_root_password).remove_user(user)
+        return {}
+
+    @job("Create Database User", priority="high")
+    def create_database_user_job(self, user, password, mariadb_root_password):
+        return self.create_database_user(user, password, mariadb_root_password)
+
+    @step("Create Database User")
+    def create_database_user(self, user, password, mariadb_root_password):
+        if user == self.user:
+            # Do not perform any operation for the main user
+            return {}
+        self.db_instance("root", mariadb_root_password).create_user(user, password)
+        return {
+            "database": self.database,
+        }
+
+    @job("Remove Database User", priority="high")
+    def remove_database_user_job(self, user, mariadb_root_password):
+        return self.remove_database_user(user, mariadb_root_password)
+
+    @step("Remove Database User")
+    def remove_database_user(self, user, mariadb_root_password):
+        if user == self.user:
+            # Do not perform any operation for the main user
+            return {}
+        self.db_instance("root", mariadb_root_password).remove_user(user)
+        return {}
+
+    @job("Modify Database User Permissions", priority="high")
+    def modify_database_user_permissions_job(self, user, mode, permissions, mariadb_root_password):
+        return self.modify_database_user_permissions(user, mode, permissions, mariadb_root_password)
+
+    @step("Modify Database User Permissions")
+    def modify_database_user_permissions(self, user, mode, permissions, mariadb_root_password):
+        if user == self.user:
+            # Do not perform any operation for the main user
+            return {}
+        self.db_instance("root", mariadb_root_password).modify_user_permissions(user, mode, permissions)
         return {}
 
     @job("Setup ERPNext", priority="high")
@@ -475,6 +530,16 @@ class Site(Base):
             cmd += " --skip-failing"
         return self.bench_execute(cmd)
 
+    @step("Log Touched Tables")
+    def log_touched_tables(self):
+        try:
+            # It will either return the touched tables
+            # or try to return the previous tables
+            return self.tables_to_restore
+        except Exception:
+            # If both file is not there, assume no tables are touched
+            return []
+
     @step("Build Search Index")
     def build_search_index(self):
         return self.bench_execute("build-search-index")
@@ -513,11 +578,7 @@ class Site(Base):
 
     def _restore_touched_tables(self):
         data = {"restored": {}}
-        try:
-            tables_to_restore = self.touched_tables
-        except Exception:
-            tables_to_restore = self.previous_tables
-        for table in tables_to_restore:
+        for table in self.tables_to_restore:
             backup_file = os.path.join(self.backup_directory, f"{table}.sql.gz")
             if os.path.exists(backup_file):
                 output = self.execute(
@@ -601,15 +662,22 @@ user = '{user}'
 set_request(path="/")
 frappe.local.cookie_manager = CookieManager()
 frappe.local.login_manager = LoginManager()
+frappe.local.request_ip = "127.0.0.1"
 frappe.local.login_manager.login_as(user)
 print(">>>" + frappe.session.sid + "<<<")
 """
 
-        output = self.bench_execute("console", input=code)["output"]
-        sid = re.search(r">>>(.*)<<<", output).group(1)
-        if not sid or sid == user:  # case when it fails
-            output = self.bench_execute(f"browse --user {user}")["output"]
-            sid = re.search(r"\?sid=([a-z0-9]*)", output).group(1)
+        sid = None
+        if (output := self.bench_execute("console", input=code)["output"]) and (
+            res := re.search(r">>>(.*)<<<", output)
+        ):
+            sid = res.group(1)
+        if (
+            (not sid or sid == user or sid == "Guest")
+            and (output := self.bench_execute(f"browse --user {user}")["output"])
+            and (res := re.search(r"\?sid=([a-z0-9]*)", output))
+        ):
+            sid = res.group(1)
         return sid
 
     @property
@@ -644,6 +712,13 @@ print(">>>" + frappe.session.sid + "<<<")
         with open(self.previous_tables_file, "r") as f:
             return json.load(f)
 
+    @property
+    def tables_to_restore(self):
+        try:
+            return self.touched_tables
+        except Exception:
+            return self.previous_tables
+
     @job("Backup Site", priority="low")
     def backup_job(self, with_files=False, offsite=None):
         backup_files = self.backup(with_files)
@@ -662,7 +737,7 @@ print(">>>" + frappe.session.sid + "<<<")
         for table in tables:
             query = f"OPTIMIZE TABLE `{table}`"
             self.execute(
-                f"mysql -sN -h {self.host} -u{self.user} -p{self.password}" f" {self.database} -e '{query}'"
+                f"mysql -sN -h {self.host} -u{self.user} -p{self.password} {self.database} -e '{query}'"
             )
 
     def fetch_latest_backup(self, with_files=True):
@@ -726,7 +801,7 @@ print(">>>" + frappe.session.sid + "<<<")
             f' WHERE `table_schema` = "{self.database}"'
             " GROUP BY `table_schema`"
         )
-        command = f"mysql -sN -h {self.host} -u{self.user} -p{self.password}" f" -e '{query}'"
+        command = f"mysql -sN -h {self.host} -u{self.user} -p{self.password} -e '{query}'"
         database_size = self.execute(command).get("output")
 
         try:
@@ -772,7 +847,7 @@ print(">>>" + frappe.session.sid + "<<<")
             f' WHERE `table_schema` = "{self.database}"'
             " GROUP BY `table_schema`"
         )
-        command = f"mysql -sN -h {self.host} -u{self.user} -p{self.password}" f" -e '{query}'"
+        command = f"mysql -sN -h {self.host} -u{self.user} -p{self.password} -e '{query}'"
         database_size = self.execute(command).get("output")
 
         try:
@@ -790,90 +865,94 @@ print(">>>" + frappe.session.sid + "<<<")
                 " AND ((`data_free` / (`data_length` + `index_length`)) > 0.2"
                 " OR `data_free` > 100 * 1024 * 1024)"
             )
-            command = f"mysql -sN -h {self.host} -u{self.user} -p{self.password}" f" -e '{query}'"
+            command = f"mysql -sN -h {self.host} -u{self.user} -p{self.password} -e '{query}'"
             output = self.execute(command).get("output")
             return [line.split("\t") for line in output.splitlines()]
         except Exception:
             return []
 
     @job("Fetch Database Table Schema")
-    def fetch_database_table_schema(self):
-        return self._fetch_database_table_schema()
+    def fetch_database_table_schema(self, include_table_size: bool = True, include_index_info: bool = True):
+        database = self.db_instance()
+        tables = {}
+        table_schemas = self._fetch_database_table_schema(database, include_index_info=include_index_info)
+        for table_name in table_schemas:
+            tables[table_name] = {
+                "columns": table_schemas[table_name],
+            }
+
+        if include_table_size:
+            table_sizes = self._fetch_database_table_sizes(database)
+            for table_name in table_sizes:
+                if table_name not in tables:
+                    continue
+                tables[table_name]["size"] = table_sizes[table_name]
+
+        return tables
 
     @step("Fetch Database Table Schema")
-    def _fetch_database_table_schema(self):
-        index_info = self.get_database_table_indexes()
-        command = f"""SELECT
-                            TABLE_NAME AS `table`,
-                            COLUMN_NAME AS `column`,
-                            DATA_TYPE AS `data_type`,
-                            IS_NULLABLE AS `is_nullable`,
-                            COLUMN_DEFAULT AS `default`
-                        FROM
-                            INFORMATION_SCHEMA.COLUMNS
-                        WHERE
-                            TABLE_SCHEMA='{self.database}';
-                    """
-        command = quote(command)
-        data = self.execute(
-            f"mysql -sN -h {self.host} -u{self.user} -p{self.password} -e {command} --batch"
-        ).get("output")
-        data = data.split("\n")
-        data = [line.split("\t") for line in data]
-        tables = {}  # <table_name>: [<column_1_info>, <column_2_info>, ...]
-        for row in data:
-            if len(row) != 5:
-                continue
-            table = row[0]
-            if table not in tables:
-                tables[table] = []
-            tables[table].append(
-                {
-                    "column": row[1],
-                    "data_type": row[2],
-                    "is_nullable": row[3] == "YES",
-                    "default": row[4],
-                    "indexes": index_info.get(table, {}).get(row[1], []),
-                }
-            )
-        return tables
+    def _fetch_database_table_schema(self, database: Database, include_index_info: bool = True):
+        return database.fetch_database_table_schema(include_index_info=include_index_info)
 
-    def get_database_table_indexes(self):
-        command = f"""
-        SELECT
-            TABLE_NAME AS `table`,
-            COLUMN_NAME AS `column`,
-            INDEX_NAME AS `index`
-        FROM
-            INFORMATION_SCHEMA.STATISTICS
-        WHERE
-            TABLE_SCHEMA='{self.database}'
-        """
-        command = quote(command)
-        data = self.execute(
-            f"mysql -sN -h {self.host} -u{self.user} -p{self.password} -e {command} --batch"
-        ).get("output")
-        data = data.split("\n")
-        data = [line.split("\t") for line in data]
-        tables = {}  # <table_name>: { <column_name> : [<index1>, <index2>, ...] }
-        for row in data:
-            if len(row) != 3:
-                continue
-            table = row[0]
-            if table not in tables:
-                tables[table] = {}
-            if row[1] not in tables[table]:
-                tables[table][row[1]] = []
-            tables[table][row[1]].append(row[2])
-        return tables
+    @step("Fetch Database Table Sizes")
+    def _fetch_database_table_sizes(self, database: Database):
+        return database.fetch_database_table_sizes()
 
     def run_sql_query(self, query: str, commit: bool = False, as_dict: bool = False):
-        database = Database(self.host, 3306, self.user, self.password, self.database)
-        success, output = database.execute_query(query, commit=commit, as_dict=as_dict)
+        db = self.db_instance()
+        success, output = db.execute_query(query, commit=commit, as_dict=as_dict)
         response = {"success": success, "data": output}
-        if not success and hasattr(database, "last_executed_query"):
-            response["failed_query"] = database.last_executed_query
+        if not success and hasattr(db, "last_executed_query"):
+            response["failed_query"] = db.last_executed_query
         return response
+
+    @job("Analyze Slow Queries")
+    def analyze_slow_queries_job(self, queries: list[dict], database_root_password: str) -> list[dict]:
+        return self.analyze_slow_queries(queries, database_root_password)
+
+    @step("Analyze Slow Queries")
+    def analyze_slow_queries(self, queries: list[dict], database_root_password: str) -> list[dict]:
+        from agent.database_optimizer import OptimizeDatabaseQueries
+
+        """
+        Args:
+            queries (list[dict]): List of queries to analyze
+                {
+                    "example": "<complete query>",
+                    "normalized": "<normalized query>",
+                }
+        """
+        example_queries = [query["example"] for query in queries]
+        optimizer = OptimizeDatabaseQueries(self, example_queries, database_root_password)
+        analysis = optimizer.analyze()
+        analysis_summary = {}  # map[query -> list[index_info_dict]
+        for query, indexes in analysis.items():
+            analysis_summary[query] = [index.to_dict() for index in indexes]
+
+        result = []  # list[{example, normalized, suggested_indexes}]
+        for query in queries:
+            query["suggested_indexes"] = analysis_summary.get(query["example"], [])
+            result.append(query)
+        return {
+            "result": result,
+        }
+
+    def fetch_summarized_database_performance_report(self, mariadb_root_password: str):
+        database = self.db_instance(username="root", password=mariadb_root_password)
+        return database.fetch_summarized_performance_report()
+
+    def fetch_database_process_list(self, mariadb_root_password: str):
+        return self.db_instance(username="root", password=mariadb_root_password).fetch_process_list()
+
+    def kill_database_process(self, pid: str, mariadb_root_password: str):
+        return self.db_instance(username="root", password=mariadb_root_password).kill_process(pid)
+
+    def db_instance(self, username: str | None = None, password: str | None = None) -> Database:
+        if not username:
+            username = self.user
+        if not password:
+            password = self.password
+        return Database(self.host, 3306, username, password, self.database)
 
     @property
     def job_record(self):
@@ -889,7 +968,5 @@ print(">>>" + frappe.session.sid + "<<<")
 
     def generate_theme_files(self):
         self.bench_execute(
-            "execute"
-            " frappe.website.doctype.website_theme.website_theme"
-            ".generate_theme_files_if_not_exist"
+            "execute frappe.website.doctype.website_theme.website_theme.generate_theme_files_if_not_exist"
         )

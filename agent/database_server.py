@@ -8,6 +8,7 @@ from pathlib import Path
 
 from peewee import MySQLDatabase
 
+from agent.database import Database
 from agent.job import job, step
 from agent.server import Server
 
@@ -130,7 +131,11 @@ class DatabaseServer(Server):
                 port=3306,
             )
             for process in processes:
-                if (process["Time"] or 0) >= kill_threshold:
+                if (
+                    (process["Time"] or 0) >= kill_threshold
+                    and process["User"] != "system user"
+                    and process["Command"] not in ["Binlog Dump", "Slave_SQL", "Slave_IO"]
+                ):
                     mariadb.execute_sql(f"KILL {process['Id']}")
         except Exception:
             import traceback
@@ -177,50 +182,17 @@ class DatabaseServer(Server):
         return list(map(lambda x: dict(zip(columns, x)), rows))
 
     @job("Column Statistics")
-    def fetch_column_stats(self, schema, table, private_ip, mariadb_root_password, doc_name):
-        self._fetch_column_stats(schema, table, private_ip, mariadb_root_password)
+    def fetch_column_stats_job(self, schema, table, private_ip, mariadb_root_password, doc_name):
+        self._fetch_column_stats_step(schema, table, private_ip, mariadb_root_password)
         return {"doc_name": doc_name}
 
     @step("Fetch Column Statistics")
-    def _fetch_column_stats(self, schema, table, private_ip, mariadb_root_password):
-        """Get various stats about columns in a table.
+    def _fetch_column_stats_step(self, schema, table, private_ip, mariadb_root_password):
+        return self.fetch_column_stats(schema, table, private_ip, mariadb_root_password)
 
-        Refer:
-            - https://mariadb.com/kb/en/engine-independent-table-statistics/
-            - https://mariadb.com/kb/en/mysqlcolumn_stats-table/
-        """
-        mariadb = MySQLDatabase(
-            "mysql",
-            user="root",
-            password=mariadb_root_password,
-            host=private_ip,
-            port=3306,
-        )
-
-        try:
-            self.sql(
-                mariadb,
-                f"ANALYZE TABLE `{schema}`.`{table}` PERSISTENT FOR ALL",
-            )
-
-            results = self.sql(
-                mariadb,
-                """
-                SELECT
-                    column_name, nulls_ratio, avg_length, avg_frequency,
-                    decode_histogram(hist_type,histogram) as histogram
-                from mysql.column_stats
-                WHERE db_name = %s
-                    and table_name = %s """,
-                (schema, table),
-            )
-
-            for row in results:
-                for column in ["nulls_ratio", "avg_length", "avg_frequency"]:
-                    row[column] = float(row[column]) if row[column] else None
-        except Exception as e:
-            print(e)
-
+    def fetch_column_stats(self, schema, table, private_ip, mariadb_root_password):
+        db = Database(private_ip, 3306, "root", mariadb_root_password, schema)
+        results = db.fetch_database_column_statistics(table)
         return {"output": json.dumps(results)}
 
     def explain_query(self, schema, query, private_ip, mariadb_root_password):
@@ -247,7 +219,7 @@ class DatabaseServer(Server):
                 # Skip files larger than 16 MB
                 continue
             if re.match(name, file.name):
-                pt_stalk_path = (os.path.join(self.pt_stalk_directory, file.name),)
+                pt_stalk_path = os.path.join(self.pt_stalk_directory, file.name)
                 with open(pt_stalk_path, errors="replace") as f:
                     output = f.read()
 

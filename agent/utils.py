@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 from datetime import datetime, timedelta
 from math import ceil
 from typing import TYPE_CHECKING
@@ -64,6 +66,8 @@ def get_size(folder):
 
 def cint(x):
     """Convert to integer"""
+    if x is None:
+        return 0
     try:
         num = int(float(x))
     except Exception:
@@ -116,3 +120,52 @@ def end_execution(
     res["status"] = status or "Success"
     res["output"] = output or res["output"]
     return res
+
+
+def compute_file_hash(file_path, algorithm="sha256", raise_exception=True):
+    try:
+        """Compute the hash of a file using the specified algorithm."""
+        hash_func = hashlib.new(algorithm)
+
+        with open(file_path, "rb") as file:
+            # read in 10MB chunks
+            while chunk := file.read(10000000):
+                hash_func.update(chunk)
+
+        return hash_func.hexdigest()
+    except FileNotFoundError:
+        if raise_exception:
+            raise
+        return "File does not exist"
+    except Exception:
+        if raise_exception:
+            raise
+        return "Failed to compute hash"
+
+
+def decode_mariadb_filename(filename: str) -> str:
+    """
+    Decode MariaDB encoded filenames that use @XXXX format for special characters.
+    """
+
+    def _hex_to_char(match: re.Match) -> str:
+        # Convert the hex value after @ to its character representation
+        hex_value = match.group(1)
+        return chr(int(hex_value, 16))
+
+    # Find @XXXX patterns and replace them with their character equivalents
+    return re.sub(r"@([0-9A-Fa-f]{4})", _hex_to_char, filename)
+
+
+def get_mariadb_table_name_from_path(path: str) -> str:
+    """
+    Extract the table name from a MariaDB table file path.
+    """
+    # Extract the filename from the path
+    filename = os.path.basename(path)
+    if not filename:
+        return ""
+    # Remove the extension
+    filename = os.path.splitext(filename)[0]
+    # Decode the filename
+    return decode_mariadb_filename(filename)
