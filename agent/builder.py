@@ -107,7 +107,7 @@ class ImageBuilder(Base):
         )
         self.output["build"] = []
         self._publish_docker_build_output(result)
-        return {"output": self.output["build"] ,'command' :command , "result":result}
+        return {"output": self.output["build"], 'command' :command}
         return {"output": self.output["build"]}
 
     def _get_build_command(self) -> str:
