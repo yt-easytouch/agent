@@ -33,6 +33,7 @@ from agent.proxysql import ProxySQL
 from agent.security import Security
 from agent.server import Server
 from agent.ssh import SSHProxy
+from agent.utils import check_installed_pyspy
 
 if TYPE_CHECKING:
     from datetime import datetime, timedelta
@@ -159,6 +160,21 @@ POST /benches
 @application.route("/ping")
 def ping():
     return {"message": "pong"}
+
+
+@application.route("/process-snapshot/<string:bench_name>")
+def get_snapshots(bench_name: str):
+    server = Server()
+    bench = server.benches.get(bench_name)
+
+    if not bench:
+        return {"message": f"No such bench {bench_name}"}, 400
+
+    if not check_installed_pyspy(server.directory):
+        return {"message": "PySpy is not installed on this server"}, 400
+
+    pids = bench.get_worker_pids()
+    return bench.take_snapshot(pids)
 
 
 @application.route("/ping_job", methods=["POST"])
@@ -1076,7 +1092,9 @@ def proxy_rename_upstream_site(upstream, site):
 )
 def update_site_status(upstream, site):
     data = request.json
-    job = Proxy().update_site_status_job(upstream, site, data["status"], data.get("skip_reload", False))
+    job = Proxy().update_site_status_job(
+        upstream, site, data["status"], data.get("skip_reload", False), data.get("extra_domains", [])
+    )
     return {"job": job}
 
 
@@ -1128,6 +1146,12 @@ def get_binary_logs():
 def get_database_processes():
     data = request.json
     return jsonify(DatabaseServer().processes(**data))
+
+
+@application.route("/database/variables", methods=["POST"])
+def get_database_variables():
+    data = request.json
+    return jsonify(DatabaseServer().variables(**data))
 
 
 @application.route("/database/locks", methods=["POST"])

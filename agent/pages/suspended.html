@@ -22,10 +22,19 @@
 
             .logo {
                 text-align: center;
+                display: flex;
+                justify-content: center;
+                align-items: center;
             }
 
             .logo svg {
-                height: 1rem;
+                height: 2rem;
+            }
+
+            .logo h1 {
+                font-size: 18px;
+                font-weight: 600;
+                color: #171717;
             }
 
             .message-container {
@@ -87,4 +96,10 @@
             </div>
         </div>
     </body>
+
+    <script>
+        const dashboardUrl = document.querySelector('.dashboard-url');
+        const siteName = window.location.hostname;        
+        dashboardUrl.href = `https://frappecloud.com/dashboard/${siteName}`;
+    </script>
 </html>

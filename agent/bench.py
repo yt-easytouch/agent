@@ -20,7 +20,7 @@ import requests
 
 from agent.app import App
 from agent.base import AgentException, Base
-from agent.exceptions import SiteNotExistsException
+from agent.exceptions import InvalidSiteConfigException, SiteNotExistsException
 from agent.job import job, step
 from agent.site import Site
 from agent.utils import download_file, end_execution, get_execution_result, get_size
@@ -42,6 +42,8 @@ if TYPE_CHECKING:
 
 class Bench(Base):
     def __init__(self, name: str, server: Server, mounts=None):
+        super().__init__()
+
         self.name = name
         self.server = server
         self.directory = os.path.join(self.server.benches_directory, name)
@@ -316,6 +318,35 @@ class Bench(Base):
             traceback.print_exc()
         return lines
 
+    def _parse_pids(self, lines):
+        pids = []
+        lines = lines.strip().split("\n")
+
+        for line in lines:
+            parts = line.strip().split()
+            name, pid = parts[0], parts[1]
+            pids.append((name, pid))
+
+        return pids
+
+    def get_worker_pids(self):
+        """Get all the processes running gunicorn for now"""
+        return self._parse_pids(self.execute(f"docker top {self.name} | grep gunicorn")["output"])
+
+    def take_snapshot(self, pid_info: list[tuple[str, str]]):
+        snapshots = {}
+        pyspy_bin = os.path.join(self.server.directory, "env/bin/py-spy")
+
+        for name, pid in pid_info:
+            try:
+                snapshots[f"{name}:{pid}"] = json.loads(
+                    self.execute(f"sudo {pyspy_bin} dump --pid {pid} --json")["output"]
+                )
+            except AgentException as e:
+                snapshots[f"{name}:{pid}"] = str(e)
+
+        return snapshots
+
     def status(self):
         status = {
             "sites": {site: {"scheduler": True, "web": True} for site in self.sites},
@@ -512,11 +543,11 @@ class Bench(Base):
         return self.rebuild()
 
     @step("Rebuild Bench Assets")
-    def rebuild(self, apps: list[str] | None = None):
+    def rebuild(self, apps: list[str] | None = None, is_inplace: bool = False):
         if not apps:
             return self.docker_execute("bench build")
 
-        if len(apps) == 1:
+        if len(apps) == 1 and not is_inplace:
             return self.docker_execute(f"bench build --app {apps[0]}")
 
         return self.docker_execute(f"bench build --apps {','.join(apps)}")
@@ -542,9 +573,9 @@ class Bench(Base):
         bench_config: dict | None = None,
     ):
         if common_site_config:
-            new_common_site_config = self.config
+            new_common_site_config = self.get_config(for_update=True)
             new_common_site_config.update(common_site_config)
-            self.setconfig(new_common_site_config)
+            self.set_config(new_common_site_config)
 
         if bench_config:
             new_bench_config = self.bench_config
@@ -790,9 +821,12 @@ class Bench(Base):
                 sites[directory] = Site(directory, self)
             except json.decoder.JSONDecodeError as jde:
                 output = self.readable_jde_err(f"Error parsing JSON in {directory}", jde)
-                self.execute(
-                    f"echo '{output}';exit {int(validate_configs)}",
-                )  # exit 1 to make sure the job fails and shows output
+                try:
+                    self.execute(
+                        f"echo '{output}';exit {int(validate_configs)}",
+                    )  # exit 1 to make sure the job fails and shows output
+                except AgentException as e:
+                    raise InvalidSiteConfigException(e.data, directory) from e
             except Exception:
                 pass
         return sites
@@ -800,8 +834,11 @@ class Bench(Base):
     def get_site(self, site):
         try:
             return self.valid_sites[site]
-        except KeyError as exc:
-            raise SiteNotExistsException(site, self.name) from exc
+        except KeyError as e:
+            raise SiteNotExistsException(site, self.name) from e
+        except InvalidSiteConfigException as e:
+            if e.site == site:
+                raise
 
     @property
     def step_record(self):
@@ -818,13 +855,22 @@ class Bench(Base):
         }
 
     @property
-    def bench_config(self):
+    def bench_config(self) -> dict:
         with open(self.bench_config_file, "r") as f:
             return json.load(f)
 
     def set_bench_config(self, value, indent=1):
-        with open(self.bench_config_file, "w") as f:
-            json.dump(value, f, indent=indent, sort_keys=True)
+        """
+        To avoid partial writes, we need to first write the config to a temporary file,
+        then rename it to the original file.
+        """
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp_file:
+            json.dump(value, temp_file, indent=indent, sort_keys=True)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+            temp_file.close()
+
+        os.rename(temp_file.name, self.bench_config_file)
 
     @job("Patch App")
     def patch_app(
@@ -907,7 +953,7 @@ class Bench(Base):
             self.migrate_sites(sites)
 
         if should_run["rebuild_frontend"]:
-            self.rebuild(apps=[app["app"] for app in apps])
+            self.rebuild(apps=[app["app"] for app in apps], is_inplace=True)
 
         # commit container changes
         self.commit_container_changes(image)

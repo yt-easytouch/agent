@@ -22,6 +22,8 @@ if TYPE_CHECKING:
 
 class Site(Base):
     def __init__(self, name: str, bench: Bench):
+        super().__init__()
+
         self.name = name
         self.bench = bench
         self.directory = os.path.join(self.bench.sites_directory, name)
@@ -234,14 +236,14 @@ class Site(Base):
             remove (list, optional): Keys sent in the form of a list will be
                 popped from the existing site config. Defaults to None.
         """
-        new_config = self.config
+        new_config = self.get_config(for_update=True)
         new_config.update(value)
 
         if remove:
             for key in remove:
                 new_config.pop(key, None)
 
-        self.setconfig(new_config)
+        self.set_config(new_config)
 
     @job("Add Domain", priority="high")
     def add_domain(self, domain):
@@ -466,17 +468,26 @@ class Site(Base):
 
     @step("Wait for Enqueued Jobs")
     def wait_till_ready(self):
-        WAIT_TIMEOUT = 120
+        WAIT_TIMEOUT = 600
         data = {"tries": []}
         start = time.time()
+        is_ready = False
         while (time.time() - start) < WAIT_TIMEOUT:
             try:
                 output = self.bench_execute("ready-for-migration")
                 data["tries"].append(output)
+                is_ready = True
                 break
             except Exception as e:
                 data["tries"].append(e.data)
                 time.sleep(1)
+
+        if not is_ready:
+            raise Exception(
+                f"Site not ready for migration after {WAIT_TIMEOUT}s."
+                f" Site might have lot of jobs in queue. Try again later."
+            )
+
         return data
 
     @step("Clear Backup Directory")
@@ -777,15 +788,14 @@ print(">>>" + frappe.session.sid + "<<<")
         backup_directory = os.path.join(self.directory, "private", "backups")
         public_directory = os.path.join(self.directory, "public")
         private_directory = os.path.join(self.directory, "private")
-        backup_directory_size = get_size(backup_directory)
 
         return {
             "database": b2mb(self.get_database_size()),
             "database_free_tables": self.get_database_free_tables(),
             "database_free": b2mb(self.get_database_free_size()),
             "public": b2mb(get_size(public_directory)),
-            "private": b2mb(get_size(private_directory) - backup_directory_size),
-            "backups": b2mb(backup_directory_size),
+            "private": b2mb(get_size(private_directory, ignore_dirs=["backups"])),
+            "backups": b2mb(get_size(backup_directory)),
         }
 
     def get_analytics(self):

@@ -29,8 +29,19 @@ def setup():
 
 
 @cli.command()
-def update():
-    Server().update_agent_cli()
+@click.option("--restart-web-workers", default=True)
+@click.option("--restart-rq-workers", default=True)
+@click.option("--restart-redis", default=True)
+@click.option("--skip-repo-setup", default=False)
+@click.option("--skip-patches", default=False)
+def update(restart_web_workers, restart_rq_workers, restart_redis, skip_repo_setup, skip_patches):
+    Server().update_agent_cli(
+        restart_redis=restart_redis,
+        restart_rq_workers=restart_rq_workers,
+        restart_web_workers=restart_web_workers,
+        skip_repo_setup=skip_repo_setup,
+        skip_patches=skip_patches,
+    )
 
 
 @cli.command()
@@ -60,7 +71,8 @@ def ping_server(password: str):
 @click.option("--workers", required=True, type=int)
 @click.option("--proxy-ip", required=False, type=str, default=None)
 @click.option("--sentry-dsn", required=False, type=str)
-def config(name, user, workers, proxy_ip=None, sentry_dsn=None):
+@click.option("--press-url", required=False, type=str)
+def config(name, user, workers, proxy_ip=None, sentry_dsn=None, press_url=None):
     config = {
         "benches_directory": f"/home/{user}/benches",
         "name": name,
@@ -71,7 +83,10 @@ def config(name, user, workers, proxy_ip=None, sentry_dsn=None):
         "workers": workers,
         "gunicorn_workers": 2,
         "web_port": 25052,
+        "press_url": "https://frappecloud.com",
     }
+    if press_url:
+        config["press_url"] = press_url
     if proxy_ip:
         config["proxy_ip"] = proxy_ip
     if sentry_dsn:
@@ -79,6 +94,17 @@ def config(name, user, workers, proxy_ip=None, sentry_dsn=None):
 
     with open("config.json", "w") as f:
         json.dump(config, f, sort_keys=True, indent=4)
+
+
+@setup.command()
+def pyspy():
+    privileges_line = "frappe ALL = (root) NOPASSWD: /home/frappe/agent/env/bin/py-spy"
+    with open("/etc/sudoers.d/frappe", "a+") as sudoers:
+        sudoers.seek(0)
+        lines = sudoers.read().splitlines()
+
+        if privileges_line not in lines:
+            sudoers.write(privileges_line + "\n")
 
 
 @setup.command()
@@ -109,10 +135,10 @@ def nginx():
 def proxy(domain=None, press_url=None):
     proxy = Proxy()
     if domain:
-        config = proxy.config
+        config = proxy.get_config(for_update=True)
         config["domain"] = domain
         config["press_url"] = press_url
-        proxy.setconfig(config, indent=4)
+        proxy.set_config(config, indent=4)
     proxy.setup_proxy()
 
 
@@ -121,10 +147,10 @@ def proxy(domain=None, press_url=None):
 def standalone(domain=None):
     server = Server()
     if domain:
-        config = server.config
+        config = server.get_config(for_update=True)
         config["domain"] = domain
         config["standalone"] = True
-        server.setconfig(config, indent=4)
+        server.set_config(config, indent=4)
 
 
 @setup.command()
@@ -176,6 +202,26 @@ def usage():
         job = cron.new(command=command)
         job.every(6).hours()
         job.minute.on(30)
+        cron.write()
+
+
+@setup.command()
+def nginx_defer_reload():
+    from crontab import CronTab
+
+    script_directory = os.path.dirname(__file__)
+    agent_directory = os.path.dirname(os.path.dirname(script_directory))
+    logs_directory = os.path.join(agent_directory, "logs")
+    script = os.path.join(script_directory, "nginx_defer_reload.py")
+    stdout = os.path.join(logs_directory, "nginx_defer_reload.log")
+    stderr = os.path.join(logs_directory, "nginx_defer_reload.error.log")
+
+    cron = CronTab(user=True)
+    command = f"cd {agent_directory} && {sys.executable} {script} 1>> {stdout} 2>> {stderr}"
+
+    if command not in str(cron):
+        job = cron.new(command=command)
+        job.minute.every(2)
         cron.write()
 
 
