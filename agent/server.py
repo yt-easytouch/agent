@@ -4,6 +4,7 @@ import json
 import os
 import platform
 import shutil
+import subprocess
 import tempfile
 import time
 from contextlib import suppress
@@ -13,13 +14,19 @@ from jinja2 import Environment, PackageLoader
 from passlib.hash import pbkdf2_sha256 as pbkdf2
 from peewee import MySQLDatabase
 
+from agent.application_storage_analyzer import (
+    analyze_benches_structure,
+    parse_docker_df_output,
+    parse_total_disk_usage_output,
+    to_bytes,
+)
 from agent.base import AgentException, Base
 from agent.bench import Bench
-from agent.exceptions import BenchNotExistsException
+from agent.exceptions import BenchNotExistsException, RegistryDownException
 from agent.job import Job, Step, job, step
 from agent.patch_handler import run_patches
 from agent.site import Site
-from agent.utils import get_supervisor_processes_status
+from agent.utils import get_supervisor_processes_status, is_registry_healthy
 
 
 class Server(Base):
@@ -48,8 +55,22 @@ class Server(Base):
         password = registry["password"]
         return self.execute(f"docker login -u {username} -p {password} {url}")
 
+    def establish_connection_with_registry(self, max_retries: int, registry: dict[str, str]):
+        """Given the attempt count try and establish connection with the registry else Raise"""
+        for attempt in range(max_retries):
+            try:
+                if not is_registry_healthy(registry["url"], registry["username"], registry["password"]):
+                    raise RegistryDownException("Registry is not available")
+                break
+            except RegistryDownException as e:
+                if attempt == max_retries - 1:
+                    raise Exception("Failed to pull image") from e
+
+                time.sleep(60)
+
     @step("Initialize Bench")
-    def bench_init(self, name, config):
+    def bench_init(self, name, config, registry: dict[str, str]):
+        self.establish_connection_with_registry(max_retries=3, registry=registry)
         bench_directory = os.path.join(self.benches_directory, name)
         os.mkdir(bench_directory)
         directories = ["logs", "sites", "config"]
@@ -91,7 +112,7 @@ class Server(Base):
     @job("New Bench", priority="low")
     def new_bench(self, name, bench_config, common_site_config, registry, mounts=None):
         self.docker_login(registry)
-        self.bench_init(name, bench_config)
+        self.bench_init(name, bench_config, registry)
         bench = Bench(name, self, mounts=mounts)
         bench.update_config(common_site_config, bench_config)
         if bench.bench_config.get("single_container"):
@@ -99,16 +120,44 @@ class Server(Base):
         bench.deploy()
         bench.setup_nginx()
 
-    def container_exists(self, name: str):
+    def container_exists(self, name: str, max_retries: int = 3):
         """
-        Throw if container exists
+        Throw if container exists; after 5 retries with backoff of 5 seconds
         """
+        for attempt in range(max_retries):
+            try:
+                self.execute(f"""docker ps --filter "name=^{name}$" | grep {name}""")
+            except AgentException:
+                break  # container does not exist
+            else:
+                if attempt == max_retries - 1:
+                    raise Exception("Container exists")
+                time.sleep(5)
+
+    def get_image_size(self, image_tag: str):
         try:
-            self.execute(f"""docker ps --filter "name=^{name}$" | grep {name}""")
+            return (
+                to_bytes(
+                    self.execute(
+                        f'docker image ls --format "{{{{.Tag}}}} {{{{.Size}}}}" | grep -E "^{image_tag} "'
+                    )["output"].split()[-1]
+                )
+                / 1024**3
+            )
         except AgentException:
-            pass  # container does not exist
-        else:
-            raise Exception("Container exists")
+            pass
+
+    def _check_site_on_bench(self, bench_name: str):
+        """Check if sites are present on the benches"""
+        sites_directory = f"/home/frappe/benches/{bench_name}/sites"
+        for possible_site in os.listdir(sites_directory):
+            if os.path.exists(os.path.join(sites_directory, possible_site, "site_config.json")):
+                raise Exception(f"Bench {bench_name} has sites")
+
+    def disable_production_on_bench(self, name: str):
+        """In case of corrupted bench / site config don't stall archive"""
+        self._check_site_on_bench(name)
+        self.execute(f"docker rm {name} --force")
 
     @job("Archive Bench", priority="low")
     def archive_bench(self, name):
@@ -118,7 +167,7 @@ class Server(Base):
         try:
             bench = Bench(name, self)
         except json.JSONDecodeError:
-            pass
+            self.disable_production_on_bench(name)
         except FileNotFoundError as e:
             if not e.filename.endswith("common_site_config.json"):
                 raise
@@ -126,6 +175,7 @@ class Server(Base):
             if bench.sites:
                 raise Exception(f"Bench has sites: {bench.sites}")
             bench.disable_production()
+
         self.container_exists(name)
         self.move_bench_to_archived_directory(name)
 
@@ -206,12 +256,12 @@ class Server(Base):
     @job("Update Site Pull", priority="low")
     def update_site_pull_job(self, name, source, target, activate):
         source = Bench(source, self)
-        target = Bench(target, self)
         site = Site(name, source)
 
         site.enable_maintenance_mode()
         site.wait_till_ready()
 
+        target = Bench(target, self)
         self.move_site(site, target)
         source.setup_nginx()
         target.setup_nginx_target()
@@ -240,7 +290,6 @@ class Server(Base):
             before_migrate_scripts = {}
 
         source = Bench(source, self)
-        target = Bench(target, self)
         site = Site(name, source)
 
         site.enable_maintenance_mode()
@@ -250,6 +299,7 @@ class Server(Base):
             site.clear_backup_directory()
             site.tablewise_backup()
 
+        target = Bench(target, self)
         self.move_site(site, target)
 
         source.setup_nginx()
@@ -347,13 +397,13 @@ class Server(Base):
         # Dangerous method (no backup),
         # use update_site_migrate if you don't know what you're doing
         source = Bench(source, self)
-        target = Bench(target, self)
         site = Site(name, source)
 
         if deactivate:  # cases when python is broken in bench
             site.enable_maintenance_mode()
             site.wait_till_ready()
 
+        target = Bench(target, self)
         self.move_site(site, target)
 
         source.setup_nginx()
@@ -400,6 +450,18 @@ class Server(Base):
             command, directory=directory, skip_output_log=skip_output_log, non_zero_throw=non_zero_throw
         )
 
+    @job("Pull Docker Images", priority="high")
+    def pull_docker_images(self, image_tags: list[str], registry: dict[str, str]) -> None:
+        self._pull_docker_images(image_tags, registry)
+
+    @step("Pull Docker Images")
+    def _pull_docker_images(self, image_tags: list[str], registry: dict[str, str]) -> None:
+        self.docker_login(registry)
+
+        for image_tag in image_tags:
+            command = f"docker pull {image_tag}"
+            self.execute(command, directory=self.directory)
+
     @job("Reload NGINX")
     def restart_nginx(self):
         return self.reload_nginx()
@@ -411,6 +473,15 @@ class Server(Base):
     @step("Update Supervisor")
     def update_supervisor(self):
         return self._update_supervisor()
+
+    @job("Update Database Host", priority="high")
+    def update_database_host_job(self, db_host: str):
+        self.update_database_host_step(db_host)
+
+    @step("Update Database Host")
+    def update_database_host_step(self, db_host: str):
+        for b in self.benches.values():
+            b._update_database_host(db_host)
 
     def setup_authentication(self, password):
         self.update_config({"access_token": pbkdf2.hash(password)})
@@ -544,6 +615,11 @@ class Server(Base):
             for worker_id in supervisor_status.get("worker", {}):
                 self.execute(f"sudo supervisorctl stop agent:worker-{worker_id}", non_zero_throw=False)
 
+        # Stop NGINX Reload Manager if it's a proxy server
+        is_proxy_server = self.config.get("domain") and self.config.get("name").startswith("n")
+        if is_proxy_server:
+            self.execute("sudo supervisorctl stop agent:nginx_reload_manager", non_zero_throw=False)
+
         # Stop redis
         if restart_redis and supervisor_status.get("redis") == "RUNNING":
             self.execute("sudo supervisorctl stop agent:redis", non_zero_throw=False)
@@ -555,9 +631,13 @@ class Server(Base):
         if restart_redis or supervisor_status.get("redis") != "RUNNING":
             self.execute("sudo supervisorctl start agent:redis")
 
+        # Start NGINX Reload Manager if it's a proxy server
+        if is_proxy_server:
+            self.execute("sudo supervisorctl start agent:nginx_reload_manager")
+
         if restart_rq_workers:
-            self.execute("sudo supervisorctl start agent:worker-0")
-            self.execute("sudo supervisorctl start agent:worker-1")
+            for i in range(self.config["workers"]):
+                self.execute(f"sudo supervisorctl start agent:worker-{i}")
 
         if restart_web_workers:
             self.execute("sudo supervisorctl start agent:web")
@@ -566,6 +646,51 @@ class Server(Base):
 
         if not skip_patches:
             run_patches()
+
+    @staticmethod
+    def run_ncdu_command(path: str, excludes: list | None = None) -> str | None:
+        cmd = ["ncdu", path, "-o", "/dev/stdout"]
+        if excludes:
+            for item in excludes:
+                cmd.extend(["--exclude", item])
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            return result.stdout if result.returncode == 0 else None
+        except subprocess.TimeoutExpired:
+            return None
+
+    def get_storage_breakdown(self) -> dict:
+        app_storage_analysis = {}
+        failed_message = "Failed to analyze storage"
+
+        benches_output = self.run_ncdu_command(
+            "/home/frappe/benches/", excludes=["node_modules", "env", "assets"]
+        )
+        docker_output = self.execute("docker system df --format '{{.Size}}'").get("output")
+        total_output = self.execute(
+            f"df -B1 {'/opt/volumes/benches' if os.path.exists('/opt/volumes/benches') else '/'}"
+        ).get("output")
+
+        if total_output:
+            total_data = parse_total_disk_usage_output(total_output)
+            app_storage_analysis["total"] = total_data
+
+        if benches_output:
+            benches_data = analyze_benches_structure(benches_output)
+            if benches_data:
+                app_storage_analysis["benches"] = benches_data
+
+        if docker_output:
+            docker_data = parse_docker_df_output(docker_output)
+            app_storage_analysis["docker"] = docker_data
+
+        return app_storage_analysis or {"error": failed_message}
 
     def get_agent_version(self):
         directory = os.path.join(self.directory, "repo")
@@ -763,17 +888,21 @@ class Server(Base):
 
     def _generate_supervisor_config(self):
         supervisor_config = os.path.join(self.directory, "supervisor.conf")
+        data = {
+            "web_port": self.config["web_port"],
+            "redis_port": self.config["redis_port"],
+            "gunicorn_workers": self.config.get("gunicorn_workers", 2),
+            "workers": self.config["workers"],
+            "directory": self.directory,
+            "user": self.config["user"],
+            "sentry_dsn": self.config.get("sentry_dsn"),
+        }
+        if self.config.get("name").startswith("n"):
+            data["is_proxy_server"] = True
+
         self._render_template(
             "agent/supervisor.conf.jinja2",
-            {
-                "web_port": self.config["web_port"],
-                "redis_port": self.config["redis_port"],
-                "gunicorn_workers": self.config.get("gunicorn_workers", 2),
-                "workers": self.config["workers"],
-                "directory": self.directory,
-                "user": self.config["user"],
-                "sentry_dsn": self.config.get("sentry_dsn"),
-            },
+            data,
             supervisor_config,
         )
 

@@ -170,20 +170,22 @@ class Bench(Base):
             non_zero_throw=non_zero_throw,
         )
 
-    def docker_execute(self, command, input=None, subdir=None, non_zero_throw=True):
+    def docker_execute(self, command, input=None, subdir=None, non_zero_throw=True, as_root: bool = False):
         interactive = "-i" if input else ""
+        as_root = "-u root" if as_root else ""
         workdir = "/home/frappe/frappe-bench"
         if subdir:
             workdir = os.path.join(workdir, subdir)
 
         if self.bench_config.get("single_container"):
-            command = f"docker exec -w {workdir} {interactive} {self.name} {command}"
+            command = f"docker exec {as_root} -w {workdir} {interactive} {self.name} {command}"
         else:
             service = f"{self.name}_worker_default"
             task = self.execute(f"docker service ps -f desired-state=Running -q --no-trunc {service}")[
                 "output"
             ].split()[0]
-            command = f"docker exec -w {workdir} {interactive} {service}.1.{task} {command}"
+            command = f"docker exec {as_root} -w {workdir} {interactive} {service}.1.{task} {command}"
+
         return self.execute(command, input=input, non_zero_throw=non_zero_throw)
 
     @step("New Site")
@@ -405,7 +407,7 @@ class Bench(Base):
         site = Site(name, self)
         site.update_config(default_config)
         try:
-            site.restore(
+            site.restore_site(
                 mariadb_root_password,
                 admin_password,
                 files["database"],
@@ -447,7 +449,7 @@ class Bench(Base):
         if not os.path.exists(download_directory):
             os.mkdir(download_directory)
         directory = tempfile.mkdtemp(prefix="agent-upload-", suffix=f"-{name}", dir=download_directory)
-        database_file = download_file(database_url, prefix=directory)
+        database_file = download_file(database_url, prefix=directory) if database_url else ""
         private_file = download_file(private_url, prefix=directory) if private_url else ""
         public_file = download_file(public_url, prefix=directory) if public_url else ""
         return {
@@ -795,6 +797,9 @@ class Bench(Base):
             cmd += f" --cpus={vcpu}"
         return self.execute(cmd)
 
+    def _update_database_host(self, db_host: str):
+        self._update_config({"db_host": db_host})
+
     @property
     def job_record(self):
         return self.server.job_record
@@ -870,7 +875,14 @@ class Bench(Base):
             os.fsync(temp_file.fileno())
             temp_file.close()
 
-        os.rename(temp_file.name, self.bench_config_file)
+        os.rename(self.bench_config_file, self.bench_config_file + ".bak")
+
+        try:
+            shutil.copy2(temp_file.name, self.bench_config_file)
+            os.remove(temp_file.name)
+        except Exception as e:
+            os.rename(self.bench_config_file + ".bak", self.bench_config_file)
+            raise e
 
     @job("Patch App")
     def patch_app(

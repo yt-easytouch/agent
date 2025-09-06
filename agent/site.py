@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -99,7 +100,7 @@ class Site(Base):
         return self.bench_execute(f"uninstall-app {app} --yes --force")
 
     @step("Restore Site")
-    def restore(
+    def restore_site(
         self,
         mariadb_root_password,
         admin_password,
@@ -130,6 +131,39 @@ class Site(Base):
             )
         finally:
             self.bench.drop_mariadb_user(self.name, mariadb_root_password, self.database)
+
+    @step("Restore Files")
+    def restore_files(
+        self,
+        public_file=None,
+        private_file=None,
+    ):
+        """Restore files from the given paths."""
+        sites_directory = self.bench.sites_directory
+
+        if public_file:
+            dir_path = os.path.join(sites_directory, self.name, "public", "files")
+            try:
+                shutil.rmtree(dir_path, ignore_errors=True)
+            finally:
+                os.makedirs(dir_path, exist_ok=True)
+
+            self.execute(
+                f"tar {'z' if public_file.endswith('.tgz') else ''}xvf {public_file} --strip 2",
+                directory=os.path.join(sites_directory, self.name),
+            )
+
+        if private_file:
+            dir_path = os.path.join(sites_directory, self.name, "private", "files")
+            try:
+                shutil.rmtree(dir_path, ignore_errors=True)
+            finally:
+                os.makedirs(dir_path, exist_ok=True)
+
+            self.execute(
+                f"tar {'z' if private_file.endswith('.tgz') else ''}xvf {private_file} --strip 2",
+                directory=os.path.join(sites_directory, self.name),
+            )
 
     @step("Checksum of Downloaded Backup Files")
     def calculate_checksum_of_backup_files(self, database_file, public_file, private_file):
@@ -163,26 +197,36 @@ class Site(Base):
         skip_failing_patches,
     ):
         files = self.bench.download_files(self.name, database, public, private)
+        is_database_restoration_required = False
         try:
-            self.restore(
-                mariadb_root_password,
-                admin_password,
-                files["database"],
-                files["public"],
-                files["private"],
-            )
+            if files["database"]:
+                is_database_restoration_required = True
+                self.restore_site(
+                    mariadb_root_password,
+                    admin_password,
+                    files["database"],
+                    files["public"],
+                    files["private"],
+                )
+            else:
+                self.restore_files(
+                    public_file=files["public"],
+                    private_file=files["private"],
+                )
         except Exception:
             self.calculate_checksum_of_backup_files(files["database"], files["public"], files["private"])
             raise
         finally:
             self.bench.delete_downloaded_files(files["directory"])
-        self.uninstall_unavailable_apps(apps)
-        self.migrate(skip_failing_patches=skip_failing_patches)
-        self.set_admin_password(admin_password)
-        self.enable_scheduler()
 
-        self.bench.setup_nginx()
-        self.bench.server.reload_nginx()
+        if is_database_restoration_required:
+            self.uninstall_unavailable_apps(apps)
+            self.migrate(skip_failing_patches=skip_failing_patches)
+            self.set_admin_password(admin_password)
+            self.enable_scheduler()
+
+            self.bench.setup_nginx()
+            self.bench.server.reload_nginx()
 
         return self.bench_execute("list-apps")
 
@@ -420,38 +464,44 @@ class Site(Base):
         return self.fetch_latest_backup(with_files=with_files)
 
     @step("Upload Site Backup to S3")
-    def upload_offsite_backup(self, backup_files, offsite):
+    def upload_offsite_backup(self, backup_files, offsite, keep_files_locally_after_offsite_backup: bool):
         import boto3
 
         offsite_files = {}
-        bucket, auth, prefix = (
-            offsite["bucket"],
-            offsite["auth"],
-            offsite["path"],
-        )
-        region = auth.get("REGION")
-
-        if region:
-            s3 = boto3.client(
-                "s3",
-                aws_access_key_id=auth["ACCESS_KEY"],
-                aws_secret_access_key=auth["SECRET_KEY"],
-                region_name=region,
+        try:
+            bucket, auth, prefix = (
+                offsite["bucket"],
+                offsite["auth"],
+                offsite["path"],
             )
-        else:
-            s3 = boto3.client(
-                "s3",
-                aws_access_key_id=auth["ACCESS_KEY"],
-                aws_secret_access_key=auth["SECRET_KEY"],
-            )
+            region = auth.get("REGION")
 
-        for backup_file in backup_files.values():
-            file_name = backup_file["file"].split(os.sep)[-1]
-            offsite_path = os.path.join(prefix, file_name)
-            offsite_files[file_name] = offsite_path
+            if region:
+                s3 = boto3.client(
+                    "s3",
+                    aws_access_key_id=auth["ACCESS_KEY"],
+                    aws_secret_access_key=auth["SECRET_KEY"],
+                    region_name=region,
+                )
+            else:
+                s3 = boto3.client(
+                    "s3",
+                    aws_access_key_id=auth["ACCESS_KEY"],
+                    aws_secret_access_key=auth["SECRET_KEY"],
+                )
 
-            with open(backup_file["path"], "rb") as data:
-                s3.upload_fileobj(data, bucket, offsite_path)
+            for backup_file in backup_files.values():
+                file_name = backup_file["file"].split(os.sep)[-1]
+                offsite_path = os.path.join(prefix, file_name)
+                offsite_files[file_name] = offsite_path
+
+                with open(backup_file["path"], "rb") as data:
+                    s3.upload_fileobj(data, bucket, offsite_path)
+        finally:
+            if not keep_files_locally_after_offsite_backup:
+                for backup_file in backup_files.values():
+                    with contextlib.suppress(FileNotFoundError):
+                        os.remove(backup_file["path"])
 
         return offsite_files
 
@@ -468,7 +518,7 @@ class Site(Base):
 
     @step("Wait for Enqueued Jobs")
     def wait_till_ready(self):
-        WAIT_TIMEOUT = 600
+        WAIT_TIMEOUT = 300
         data = {"tries": []}
         start = time.time()
         is_ready = False
@@ -731,10 +781,14 @@ print(">>>" + frappe.session.sid + "<<<")
             return self.previous_tables
 
     @job("Backup Site", priority="low")
-    def backup_job(self, with_files=False, offsite=None):
+    def backup_job(
+        self, with_files=False, offsite=None, keep_files_locally_after_offsite_backup: bool = False
+    ):
         backup_files = self.backup(with_files)
         uploaded_files = (
-            self.upload_offsite_backup(backup_files, offsite) if (offsite and backup_files) else {}
+            self.upload_offsite_backup(backup_files, offsite, keep_files_locally_after_offsite_backup)
+            if (offsite and backup_files)
+            else {}
         )
         return {"backups": backup_files, "offsite": uploaded_files}
 
@@ -834,7 +888,11 @@ print(">>>" + frappe.session.sid + "<<<")
 
     @property
     def apps(self):
-        return self.bench_execute("list-apps")["output"]
+        return self.bench_execute("execute frappe.get_installed_apps")["output"]
+
+    @property
+    def apps_as_json(self):
+        return json.loads(self.bench_execute("list-apps -f json")["output"])[self.name]
 
     @job("Add Database Index")
     def add_database_index(self, doctype, columns=None):
