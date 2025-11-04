@@ -2,16 +2,7 @@ from __future__ import annotations
 
 import json
 
-
-def format_size(bytes_val):
-    thresholds = [(1024**3, "GB"), (1024**2, "MB"), (1024, "KB")]
-
-    for factor, suffix in thresholds:
-        if bytes_val >= factor:
-            value = bytes_val / factor
-            return f"{value:.2f}{suffix}"
-
-    return f"{bytes_val}B"
+from agent.utils import format_size, to_bytes
 
 
 def to_bytes(size_str: str) -> float:

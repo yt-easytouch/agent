@@ -220,6 +220,39 @@ def get_server():
     return Server().dump()
 
 
+@application.route("/server/change-bench-directory", methods=["POST"])
+def change_bench_directory():
+    data = request.json
+    job = Server().change_bench_directory(
+        is_primary=data.get("is_primary"),
+        directory=data.get("directory"),
+        redis_password=data.get("redis_password"),
+        secondary_server_private_ip=data.get("secondary_server_private_ip"),
+        redis_connection_string_ip=data.get("redis_connection_string_ip"),
+        restart_benches=data.get("restart_benches"),
+        registry_settings=data.get("registry_settings"),
+    )
+    return {"job": job}
+
+
+@application.route("/server/stop-bench-workers", methods=["POST"])
+def stop_bench_workers():
+    job = Server().stop_bench_workers()
+    return {"job": job}
+
+
+@application.route("/server/start-bench-workers", methods=["POST"])
+def start_bench_workers():
+    job = Server().start_bench_workers()
+    return {"job": job}
+
+
+@application.route("/server/force-remove-all-benches", methods=["POST"])
+def force_remove_all_benches():
+    job = Server().force_remove_all_benches()
+    return {"job": job}
+
+
 @application.route("/server/reload", methods=["POST"])
 def restart_nginx():
     job = Server().restart_nginx()
@@ -240,7 +273,8 @@ def get_server_status():
 
 @application.route("/server/cleanup", methods=["POST"])
 def cleanup_unused_files():
-    job = Server().cleanup_unused_files()
+    data = request.json
+    job = Server().cleanup_unused_files(force=data.get("force", False))
     return {"job": job}
 
 
@@ -257,10 +291,44 @@ def get_docker_image_size(image_tag: str):
     return {"size": size}
 
 
+@application.route("/server/reclaimable-size", methods=["GET"])
+def get_reclaimable_size():
+    return Server().get_reclaimable_size()
+
+
 @application.route("/server/pull-images", methods=["POST"])
 def pull_docker_images():
     data = request.json
     job = Server().pull_docker_images(data.get("image_tags"), data.get("registry"))
+    return {"job": job}
+
+
+@application.route("/nfs/add-to-acl", methods=["POST"])
+def add_to_acl():
+    data = request.json
+    Server().add_to_acl(
+        primary_server_private_ip=data.get("primary_server_private_ip"),
+        secondary_server_private_ip=data.get("secondary_server_private_ip"),
+        shared_directory=data.get("shared_directory"),
+    )
+    return {"shared_directory": f"/home/frappe/nfs/{data.get('private_ip')}"}
+
+
+@application.route("/nfs/remove-from-acl", methods=["POST"])
+def remove_from_acl():
+    data = request.json
+    Server().remove_from_acl(
+        primary_server_private_ip=data.get("primary_server_private_ip"),
+        secondary_server_private_ip=data.get("secondary_server_private_ip"),
+        shared_directory=data.get("shared_directory"),
+    )
+    return {"shared_directory": f"/home/frappe/nfs/{data.get('private_ip')}"}
+
+
+@application.route("/nfs/share-sites", methods=["POST"])
+def share_sites():
+    data = request.json
+    job = Server().share_sites(server_name=data.get("server_name"))
     return {"job": job}
 
 
@@ -1236,7 +1304,14 @@ def explain():
 @application.route("/database/binlogs/purge", methods=["POST"])
 def purge_binlog():
     data = request.json
-    return jsonify(DatabaseServer().purge_binlog(**data))
+    return jsonify(DatabaseServer()._purge_binlog(**data))
+
+
+@application.route("/database/binlogs/purge_by_size_limit", methods=["POST"])
+def purge_binlogs_by_size_limit():
+    data = request.json
+    job = DatabaseServer().purge_binlogs_by_size_limit(**data)
+    return {"job": job}
 
 
 @application.route("/database/binlogs/list", methods=["GET"])
