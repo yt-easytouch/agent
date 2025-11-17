@@ -226,7 +226,6 @@ def change_bench_directory():
     job = Server().change_bench_directory(
         is_primary=data.get("is_primary"),
         directory=data.get("directory"),
-        redis_password=data.get("redis_password"),
         secondary_server_private_ip=data.get("secondary_server_private_ip"),
         redis_connection_string_ip=data.get("redis_connection_string_ip"),
         restart_benches=data.get("restart_benches"),
@@ -307,22 +306,18 @@ def pull_docker_images():
 def add_to_acl():
     data = request.json
     Server().add_to_acl(
-        primary_server_private_ip=data.get("primary_server_private_ip"),
         secondary_server_private_ip=data.get("secondary_server_private_ip"),
-        shared_directory=data.get("shared_directory"),
     )
-    return {"shared_directory": f"/home/frappe/nfs/{data.get('private_ip')}"}
+    return {"shared_directory": "/home/frappe/shared"}
 
 
 @application.route("/nfs/remove-from-acl", methods=["POST"])
 def remove_from_acl():
     data = request.json
     Server().remove_from_acl(
-        primary_server_private_ip=data.get("primary_server_private_ip"),
         secondary_server_private_ip=data.get("secondary_server_private_ip"),
-        shared_directory=data.get("shared_directory"),
     )
-    return {"shared_directory": f"/home/frappe/nfs/{data.get('private_ip')}"}
+    return {"shared_directory": "/home/frappe/shared"}
 
 
 @application.route("/nfs/share-sites", methods=["POST"])
