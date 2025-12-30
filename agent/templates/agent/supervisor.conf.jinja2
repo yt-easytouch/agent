@@ -64,8 +64,5 @@ directory={{ directory }}
     {% set programs = programs + ", nginx_reload_manager" %}
 {% endif %}
 
-{% if is_secondary %}
-    {% set programs = programs + ", monitor_idle" %}
-{% endif %}
 
 programs={{ programs }}

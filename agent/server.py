@@ -201,6 +201,41 @@ class Server(Base):
             "total": round((unused_images_size + total_archived_folder_size) / 1024**3, 2),
         }
 
+    @job("Push Images to Registry")
+    def push_images_to_registry(self, images: list[str], registry_settings: dict[str, str]) -> None:
+        return self._push_images_to_registry(images, registry_settings)
+
+    @step("Push Images to Registry")
+    def _push_images_to_registry(self, images: list[str], registry_settings: dict[str, str]) -> None:
+        self.docker_login(registry_settings)
+        for image in images:
+            self.execute(f"docker push {image}")
+
+    @job("Remove Redis Localhost Bind")
+    def remove_redis_localhost_bind(self):
+        """Bind redis to 0.0.0.0 on all benches"""
+        return self._remove_redis_localhost_bind()
+
+    @step("Remove Redis Localhost Bind")
+    def _remove_redis_localhost_bind(self):
+        for bench in self.benches:
+            files = [
+                os.path.join(self.benches_directory, bench, "config", "redis-cache.conf"),
+                os.path.join(self.benches_directory, bench, "config", "redis-queue.conf"),
+            ]
+
+            for path in files:
+                if not os.path.exists(path):
+                    continue
+
+                with open(path, "r") as f:
+                    content = f.read()
+
+                content = content.replace("127.0.0.1", "0.0.0.0")
+
+                with open(path, "w") as f:
+                    f.write(content)
+
     def _check_site_on_bench(self, bench_name: str):
         """Check if sites are present on the benches"""
         sites_directory = f"/home/frappe/benches/{bench_name}/sites"
@@ -245,11 +280,14 @@ class Server(Base):
             common_site_config = bench.get_config(for_update=True)
 
             for key in ("redis_cache", "redis_queue", "redis_socketio"):
+                offset = 18000 - bench.bench_config["web_port"]
+                rq_cache_port = 13000 + offset
+
                 if private_ip != "localhost":
                     port = (
                         bench.bench_config["rq_port"]
                         if key == "redis_queue"
-                        else bench.bench_config["rq_cache_port"]
+                        else bench.bench_config.get("rq_cache_port") or rq_cache_port
                     )
                 else:
                     port = 11000 if key == "redis_queue" else 13000
@@ -800,7 +838,7 @@ class Server(Base):
         skip_patches=False,
     ):
         directory = os.path.join(self.directory, "repo")
-        if skip_repo_setup:
+        if not skip_repo_setup:
             self.execute("git reset --hard", directory=directory)
             self.execute("git clean -fd", directory=directory)
             self.execute("git fetch upstream", directory=directory)
@@ -834,8 +872,14 @@ class Server(Base):
         if restart_redis or supervisor_status.get("redis") != "RUNNING":
             self.execute("sudo supervisorctl start agent:redis")
 
-        # Start NGINX Reload Manager if it's a proxy server
         if is_proxy_server:
+            from agent.proxy import Proxy
+
+            # Call proxy setup to re-generate configuration
+            proxy = Proxy()
+            proxy.setup_proxy()
+
+            # Start NGINX Reload Manager if it's a proxy server
             self.execute("sudo supervisorctl start agent:nginx_reload_manager")
 
         if restart_rq_workers:
@@ -989,12 +1033,13 @@ class Server(Base):
     def mariadb_processlist(self, mariadb_root_password):
         processes = []
         try:
+            db_port = self.config.get("db_port", 3306)
             mariadb = MySQLDatabase(
                 "mysql",
                 user="root",
                 password=mariadb_root_password,
                 host="localhost",
-                port=3306,
+                port=db_port,
             )
             cursor = mariadb.execute_sql("SHOW PROCESSLIST")
             rows = cursor.fetchall()
