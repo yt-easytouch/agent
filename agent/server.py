@@ -531,12 +531,14 @@ class Server(Base):
             site.run_app_scripts(before_migrate_scripts)
 
         try:
+            target.update_runtime_limits(2)
             site.migrate(
                 skip_search_index=skip_search_index,
                 skip_failing_patches=skip_failing_patches,
             )
         finally:
             site.log_touched_tables()
+            target.update_runtime_limits()
 
         with suppress(Exception):
             site.bench_execute(
@@ -730,6 +732,18 @@ class Server(Base):
             secondary_server_private_ip=secondary_server_private_ip,
         )
 
+    @job("Update NGINX IP access")
+    def update_nginx_access(self, ip_accept: list[str], ip_drop: list[str]):
+        self.update_config_ip(ip_accept, ip_drop)
+        self.update_agent_nginx_config()
+        self.reload_nginx()
+
+    @step("Update config IP access")
+    def update_config_ip(self, ip_accept: list[str], ip_drop: list[str]):
+        config = self.get_config(for_update=True)
+        config.update({"ip_accept": ip_accept, "ip_drop": ip_drop})
+        self.set_config(config, indent=4)
+
     def update_config(self, value):
         config = self.get_config(for_update=True)
         config.update(value)
@@ -753,6 +767,10 @@ class Server(Base):
 
     def setup_sentry(self, sentry_dsn):
         self.update_config({"sentry_dsn": sentry_dsn})
+        self.setup_supervisor()
+
+    def setup_job_timeout(self, job_timeout):
+        self.update_config({"job_timeout": job_timeout})
         self.setup_supervisor()
 
     def setup_nginx(self):
@@ -1101,6 +1119,8 @@ class Server(Base):
                 "nginx_vts_module_enabled": self.config.get("nginx_vts_module_enabled", True),
                 "ip_whitelist": self.config.get("ip_whitelist", []),
                 "conf_directory": os.path.join(self.config.get("benches_directory"), "*", "nginx.conf"),
+                "ip_accept": self.config.get("ip_accept", []),
+                "ip_drop": self.config.get("ip_drop", []),
             },
             nginx_config,
         )

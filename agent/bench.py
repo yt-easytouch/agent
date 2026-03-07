@@ -467,12 +467,39 @@ class Bench(Base):
         shutil.rmtree(backup_files_directory)
 
     @job("Archive Site")
-    def archive_site(self, name, mariadb_root_password, force):
+    def archive_site(
+        self,
+        name,
+        mariadb_root_password,
+        force,
+        offsite=None,
+    ):
         site_directory = os.path.join(self.sites_directory, name)
+        backups = None
+
         if os.path.exists(site_directory):
-            self.bench_archive_site(name, mariadb_root_password, force)
-        self.setup_nginx()
-        self.server._reload_nginx()
+            if offsite:
+                site = Site(name, self)
+                backup_files = site.backup(with_files=True)
+                uploaded_files = (
+                    site.upload_offsite_backup(
+                        backup_files, offsite, keep_files_locally_after_offsite_backup=False
+                    )
+                    if (backup_files)
+                    else {}
+                )
+                backups = {"backups": backup_files, "offsite": uploaded_files}
+
+            self.bench_archive_site(
+                name,
+                mariadb_root_password,
+                force,
+            )
+
+            self.setup_nginx()
+            self.server._reload_nginx()
+
+        return backups
 
     @step("Bench Setup NGINX")
     def setup_nginx(self):
@@ -849,10 +876,10 @@ class Bench(Base):
         self._update_runtime_limits(memory_high, memory_max, memory_swap, vcpu)
         self._start()
 
-    def update_runtime_limits(self):
-        memory_high = self.bench_config.get("memory_high")
-        memory_max = self.bench_config.get("memory_max")
-        memory_swap = self.bench_config.get("memory_swap")
+    def update_runtime_limits(self, multiplier=1.0):
+        memory_high = (self.bench_config.get("memory_high") or 0) * multiplier
+        memory_max = (self.bench_config.get("memory_max") or 0) * multiplier
+        memory_swap = (self.bench_config.get("memory_swap") or 0) * multiplier
         vcpu = self.bench_config.get("vcpu")
         if not any([memory_high, memory_max, memory_swap, vcpu]):
             return

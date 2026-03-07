@@ -32,7 +32,6 @@ from agent.nginx_reload_manager import NginxReloadManager
 from agent.nginx_reload_manager import ReloadStatus as NginxReloadStatus
 from agent.proxy import Proxy
 from agent.proxysql import ProxySQL
-from agent.security import Security
 from agent.server import Server
 from agent.snapshot_recovery import SnapshotRecovery
 from agent.ssh import SSHProxy
@@ -55,6 +54,16 @@ if TYPE_CHECKING:
 
 
 application = Flask(__name__)
+
+SENSITIVE_CONFIG_KEYS = {
+    "access_token",
+    "redis_port",
+    "redis_password",
+    "db_password",
+    "db_user",
+    "db_host",
+    "db_port",
+}
 
 
 def validate_bench(fn):
@@ -210,6 +219,7 @@ def build_image():
         no_push=data.get("no_push"),
         registry=data.get("registry"),
         platform=data.get("platform", "linux/amd64"),
+        build_token=data.get("build_token"),
     )
     job = image_builder.run_remote_builder()
     return {"job": job}
@@ -315,6 +325,35 @@ def pull_docker_images():
     data = request.json
     job = Server().pull_docker_images(data.get("image_tags"), data.get("registry"))
     return {"job": job}
+
+
+@application.route("/server/update-nginx-access", methods=["POST"])
+def update_nginx_ip_access():
+    data = request.json
+    job = Server().update_nginx_access(
+        ip_accept=data.get("ip_accept", []),
+        ip_drop=data.get("ip_drop", []),
+    )
+    return {"job": job}
+
+
+@application.route("/server/get-config", methods=["GET"])
+def get_server_config():
+    config = dict(Server().config or {})
+    return {key: value for key, value in config.items() if key not in SENSITIVE_CONFIG_KEYS}
+
+
+@application.route("/server/update-config", methods=["POST"])
+def update_server_config():
+    config = request.json
+    if not isinstance(config, dict):
+        return jsonify({"error": "Invalid config payload; expected a JSON object."}), 400
+    sanitized_config = {key: value for key, value in config.items() if key not in SENSITIVE_CONFIG_KEYS}
+    stripped_keys = set(config.keys()) - set(sanitized_config.keys())
+    if stripped_keys:
+        log.warning("Stripping sensitive config in updating: %s", (",").join(sorted(stripped_keys)))
+    Server().update_config(sanitized_config)
+    return {"update_config": True}
 
 
 @application.route("/nfs/add-to-acl", methods=["POST"])
@@ -450,16 +489,6 @@ def get_logs(bench, site):
 @validate_bench_and_site
 def get_log(bench, site, log):
     return {log: Server().benches[bench].sites[site].retrieve_log(log)}
-
-
-@application.route("/security/ssh_session_logs")
-def get_ssh_session_logs():
-    return {"logs": Security().ssh_session_logs}
-
-
-@application.route("/security/retrieve_ssh_session_log/<string:filename>")
-def retrieve_ssh_session_log(filename):
-    return {"log_details": Security().retrieve_ssh_session_log(filename)}
 
 
 @application.route("/benches/<string:bench>/sites/<string:site>/sid", methods=["GET", "POST"])
@@ -665,7 +694,8 @@ def install_app_site(bench, site):
 )
 @validate_bench_and_site
 def uninstall_app_site(bench, site, app):
-    job = Server().benches[bench].sites[site].uninstall_app_job(app)
+    data = request.json or {}
+    job = Server().benches[bench].sites[site].uninstall_app_job(app, data.get("offsite", {}))
     return {"job": job}
 
 
@@ -975,7 +1005,11 @@ def update_site_recover(bench, site):
 @validate_bench
 def archive_site(bench, site):
     data = request.json
-    job = Server().benches[bench].archive_site(site, data["mariadb_root_password"], data.get("force"))
+    job = (
+        Server()
+        .benches[bench]
+        .archive_site(site, data["mariadb_root_password"], data.get("force"), data.get("offsite", {}))
+    )
     return {"job": job}
 
 
@@ -1061,7 +1095,9 @@ def site_create_database_access_credentials(bench, site):
         Server()
         .benches[bench]
         .sites[site]
-        .create_database_access_credentials(data["mode"], data["mariadb_root_password"])
+        .create_database_access_credentials(
+            mariadb_root_password=data.get("mariadb_root_password"),
+        )
     )
 
 
@@ -1255,9 +1291,27 @@ def physical_restore_database():
 @application.route("/database/update-schema-sizes", methods=["POST"])
 def update_schema_sizes():
     data = request.json
+    private_ip = data.get("private_ip")
+    mariadb_root_password = data.get("mariadb_root_password")
+    io_ops_limit = data.get("io_ops_limit", 200)
+    concurrency = data.get("concurrency", 20)
+    job = DatabaseServer().update_schema_sizes_job(
+        private_ip=private_ip,
+        mariadb_root_password=mariadb_root_password,
+        io_ops_limit=io_ops_limit,
+        concurrency=concurrency,
+    )
+    return {"job": job}
+
+
+@application.route("/database/flush-tables", methods=["POST"])
+def flush_tables():
+    data = request.json
     assert "private_ip" in data, "private_ip is required"
     assert "mariadb_root_password" in data, "mariadb_root_password is required"
-    job = DatabaseServer().update_schema_sizes_job(**data)
+    job = DatabaseServer().flush_tables_job(
+        private_ip=data["private_ip"], mariadb_root_password=data["mariadb_root_password"]
+    )
     return {"job": job}
 
 

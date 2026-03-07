@@ -46,7 +46,9 @@ class Site(Base):
             raise OSError(f"Path {self.config_file} does not exist")
 
         self.database = self.config["db_name"]
-        self.user = self.config["db_name"]
+        self.user = (
+            self.config.get("db_user") or self.config["db_name"]
+        )  # Prefer the db user specified in site config, fallback to db name for backward compatibility
         self.password = self.config["db_password"]
         self.host = self.config.get("db_host", self.bench.host)
         self.db_port = self.config.get("db_port", self.bench.db_port)
@@ -99,7 +101,7 @@ class Site(Base):
 
     @step("Uninstall App from Site")
     def uninstall_app(self, app):
-        return self.bench_execute(f"uninstall-app {app} --yes --force")
+        return self.bench_execute(f"uninstall-app {app} --no-backup --yes --force")
 
     @step("Restore Site")
     def restore_site(
@@ -270,8 +272,20 @@ class Site(Base):
         self.install_app(app)
 
     @job("Uninstall App on Site")
-    def uninstall_app_job(self, app):
+    def uninstall_app_job(self, app, offsite=None):
+        backups = None
+        if offsite:
+            backup_files = self.backup(with_files=True)
+            uploaded_files = (
+                self.upload_offsite_backup(
+                    backup_files, offsite, keep_files_locally_after_offsite_backup=False
+                )
+                if (backup_files)
+                else {}
+            )
+            backups = {"backups": backup_files, "offsite": uploaded_files}
         self.uninstall_app(app)
+        return backups
 
     @step("Update Site Configuration")
     def update_config(self, value, remove=None):
@@ -307,23 +321,28 @@ class Site(Base):
         self.bench.setup_nginx()
         self.bench.server.reload_nginx()
 
-    def create_database_access_credentials(self, mode, mariadb_root_password):
-        database = self.database
-        user = f"{self.user}_{mode}"
-        password = self.bench.get_random_string(16)
-        privileges = {
-            "read_only": "SELECT",
-            "read_write": "ALL",
-        }.get(mode, "SELECT")
-        queries = [
-            f"CREATE OR REPLACE USER '{user}'@'%' IDENTIFIED BY '{password}'",
-            f"GRANT {privileges} ON {database}.* TO '{user}'@'%'",
-            "FLUSH PRIVILEGES",
-        ]
-        for query in queries:
-            command = f'mysql -h {self.host} -P {self.db_port} -uroot -p{mariadb_root_password} -e "{query}"'
-            self.execute(command)
-        return {"database": database, "user": user, "password": password}
+    def create_database_access_credentials(self, mariadb_root_password: str):
+        """Grant access to the database for the user from any host if not already granted."""
+        database = self.db_instance(username="root", password=mariadb_root_password)
+
+        # Check if the user already has access from any host
+        query = f"SELECT host FROM mysql.user WHERE user = '{self.user}'"
+        status, result = database.execute_query(query, as_dict=True)
+
+        if not status:
+            # Query failed for some reason?
+            return None
+
+        hosts = [row["Host"] for row in result[0]["output"]]
+        if "%" in hosts:
+            # User already has access from any host
+            return {"database": self.database, "user": self.user, "password": self.password}
+
+        for host in hosts:
+            database.rename_user(old_user=self.user, old_host=host, new_user=self.user, new_host="%")
+            break  # Rename only the first occurrence mostly won't be needed by just in case
+
+        return {"database": self.database, "user": self.user, "password": self.password}
 
     def revoke_database_access_credentials(self, user, mariadb_root_password):
         if user == self.user:
@@ -804,7 +823,10 @@ print(">>>" + frappe.session.sid + "<<<")
 
     @job("Backup Site", priority="low")
     def backup_job(
-        self, with_files=False, offsite=None, keep_files_locally_after_offsite_backup: bool = False
+        self,
+        with_files=False,
+        offsite=None,
+        keep_files_locally_after_offsite_backup: bool = False,
     ):
         backup_files = self.backup(with_files)
         uploaded_files = (
@@ -897,8 +919,6 @@ print(">>>" + frappe.session.sid + "<<<")
 
         return {
             "database": b2mb(self.get_database_size()),
-            "database_free_tables": self.get_database_free_tables(),
-            "database_free": b2mb(self.get_database_free_size()),
             "public": b2mb(get_size(public_directory)),
             "private": b2mb(get_size(private_directory, ignore_dirs=["backups"])),
             "backups": b2mb(get_size(backup_directory)),
@@ -909,19 +929,26 @@ print(">>>" + frappe.session.sid + "<<<")
         return json.loads(analytics)
 
     def get_database_size(self):
-        # try:
-        #     query = f'SELECT size FROM press_meta.schema_sizes WHERE `schema` = "{self.database}"'
-        #     command = f"mysql -sN -h {self.host} -P {self.db_port} \
-        #         -u{self.user} -p{self.password} -e '{query}'"
-        #     database_size = self.execute(command).get("output")
-        # except Exception:
-        # # Fallback to old way if press_meta is not available
+        config = {}
+        with open(os.path.join(os.getcwd(), "config.json")) as f:
+            config = json.load(f)
 
         try:
+            if not (config and config.get("use_press_meta_for_database_size")):
+                raise Exception("Press Meta not enabled for database size calculation")
+
+            query = f'SELECT size FROM press_meta.schema_sizes WHERE `schema` = "{self.database}"'
+            command = f"mysql -sN -h {self.host} -P {self.db_port} \
+                    -u{self.user} -p{self.password} -e '{query}'"
+            database_size = self.execute(command).get("output")
+
+        except Exception:
+            # Fallback to old way if press_meta is not available
+
             # only specific to mysql/mariaDB. use a different query for postgres.
             # or try using frappe.db.get_database_size if possible
             query = (
-                "SELECT SUM(`data_length` + `index_length` + `data_free`)"
+                "SELECT SUM(`data_length` + `index_length`)"
                 " FROM information_schema.tables"
                 f' WHERE `table_schema` = "{self.database}"'
                 " GROUP BY `table_schema`"
@@ -929,8 +956,7 @@ print(">>>" + frappe.session.sid + "<<<")
             command = f"mysql -sN -h {self.host} -P {self.db_port} \
                 -u{self.user} -p{self.password} -e '{query}'"
             database_size = self.execute(command).get("output")
-        except Exception as e:
-            raise e
+
         try:
             assert database_size is not None, "Could not fetch database size"
             return int(database_size)
@@ -968,7 +994,7 @@ print(">>>" + frappe.session.sid + "<<<")
     def _add_database_index(self, doctype, columns):
         command = f"add-database-index --doctype '{doctype}' "
         for column in columns:
-            command += f"--column {column} "
+            command += f"--column '{column}' "
 
         return self.bench_execute(command)
 
