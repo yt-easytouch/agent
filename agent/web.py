@@ -256,6 +256,11 @@ def start_bench_workers():
     return {"job": job}
 
 
+@application.route("/server/running-benches", methods=["GET"])
+def get_running_benches():
+    return {"benches": Server().get_running_bench_containers()}
+
+
 @application.route("/server/force-remove-all-benches", methods=["POST"])
 def force_remove_all_benches():
     job = Server().force_remove_all_benches()
@@ -509,6 +514,14 @@ def new_bench():
 @application.route("/benches/<string:bench>/archive", methods=["POST"])
 def archive_bench(bench):
     job = Server().archive_bench(bench)
+    return {"job": job}
+
+
+@application.route("/benches/force-remove", methods=["POST"])
+def force_remove_zombie_benches():
+    data = request.json
+    benches = data.get("benches", [])
+    job = Server().force_remove_zombie_benches(benches)
     return {"job": job}
 
 
@@ -1311,6 +1324,24 @@ def flush_tables():
     assert "mariadb_root_password" in data, "mariadb_root_password is required"
     job = DatabaseServer().flush_tables_job(
         private_ip=data["private_ip"], mariadb_root_password=data["mariadb_root_password"]
+    )
+    return {"job": job}
+
+
+@application.route("/database/refresh-usage", methods=["POST"])
+def refresh_database_usage():
+    data = request.json
+    private_ip = data.get("private_ip")
+    mariadb_root_password = data.get("mariadb_root_password")
+    database = data.get("database")
+    io_ops_limit = data.get("io_ops_limit", 200)
+    concurrency = data.get("concurrency", 20)
+    job = DatabaseServer().refresh_database_usage_job(
+        private_ip=private_ip,
+        mariadb_root_password=mariadb_root_password,
+        database=database,
+        io_ops_limit=io_ops_limit,
+        concurrency=concurrency,
     )
     return {"job": job}
 
