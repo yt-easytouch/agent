@@ -8,6 +8,7 @@ from pathlib import Path
 
 from agent.job import job, step
 from agent.server import Server
+from agent.utils import db_dump_cli
 
 
 def read_json(file_path: str) -> dict | None:
@@ -151,8 +152,10 @@ class SnapshotRecovery(Server):
     def _backup_db(
         self, site: str, database_ip: str, database_name: str, mariadb_root_password: str, file_path: str
     ) -> str:
+        dump_command = db_dump_cli()
+
         command = [
-            "mysqldump",
+            dump_command,
             "-h",
             database_ip,
             "-u",

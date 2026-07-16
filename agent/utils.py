@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import secrets
+import shutil
 import struct
 import subprocess
 from collections import defaultdict
@@ -57,7 +59,15 @@ def to_bytes(size_str: str) -> float:
 
 def download_file(url, prefix):
     """Download file locally under path prefix and return local path"""
-    filename = urlparse(url).path.split("/")[-1]
+    basename = os.path.basename(urlparse(url).path)
+    ext = ""
+    for known in (".sql.gz", ".tar.gz", ".tgz", ".sql", ".gz", ".tar"):
+        if basename.endswith(known):
+            ext = known
+            break
+    if ext and not all(c.isalnum() or c in "._-" for c in ext):
+        ext = ""
+    filename = secrets.token_urlsafe(16) + ext
     local_filename = os.path.join(prefix, filename)
 
     with requests.get(url, stream=True) as r:
@@ -325,3 +335,19 @@ def parse_fts_index_prefixlen_from_cfg(file_path: str) -> dict[str, int]:  # noq
             result[index_name] = max_prefix_len
 
     return result
+
+
+def db_client_cli():
+    if shutil.which("mariadb") is not None:
+        return "mariadb"
+    if shutil.which("mysql") is not None:
+        return "mysql"
+    raise RuntimeError("Neither 'mariadb' nor 'mysql' client is installed on the system.")
+
+
+def db_dump_cli():
+    if shutil.which("mariadb-dump") is not None:
+        return "mariadb-dump"
+    if shutil.which("mysqldump") is not None:
+        return "mysqldump"
+    raise RuntimeError("Neither 'mariadb-dump' nor 'mysqldump' client is installed on the system.")

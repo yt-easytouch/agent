@@ -12,7 +12,7 @@ import requests
 from agent.database import CustomPeeweeDB
 from agent.database_server import DatabaseServer
 from agent.job import job, step
-from agent.utils import compute_file_hash, decode_mariadb_filename
+from agent.utils import compute_file_hash, db_dump_cli, decode_mariadb_filename
 
 
 class DatabasePhysicalBackup(DatabaseServer):
@@ -260,7 +260,9 @@ class DatabasePhysicalBackup(DatabaseServer):
                     "name": self.site_backup_name,
                     "key": self.snapshot_request_key,
                 },
+                timeout=(10, 30),
             )
+
             if response.status_code in [417, 500, 502, 503, 504] and retries <= 10:
                 retries += 1
                 time.sleep(15 + randint(2, 8))
@@ -277,7 +279,7 @@ class DatabasePhysicalBackup(DatabaseServer):
     def export_table_schema(self, db_name: str) -> str:
         self._kill_other_db_connections(db_name)
         command = [
-            "mariadb-dump",
+            db_dump_cli(),
             "-u",
             self._db_user,
             "-p" + self._db_password,
