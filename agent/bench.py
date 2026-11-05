@@ -1036,7 +1036,7 @@ class Bench(Base):
         self.git_apply(app, revert, patch_container_path)
 
         if build_assets:
-            self.rebuild()
+            self.rebuild([app])
 
         self.restart()
 
