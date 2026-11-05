@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import re
@@ -18,6 +19,12 @@ from agent.database import CustomPeeweeDB, Database
 from agent.job import job, step
 from agent.server import Server
 
+# server_audit rotates server_audit.log to .1, .1 to .2 and so on. We move those to
+# audit_pending under a name that can't be reused, then upload and delete from there.
+AUDIT_LOG_ROTATED_RE = re.compile(r"^server_audit\.log\.\d+$")
+AUDIT_LOG_STAGED_RE = re.compile(r"^server_audit_\d{14}_\d+\.log$")
+AUDIT_LOG_RECORD_RE = re.compile(r"^\d{8} \d{2}:\d{2}:\d{2},")
+
 
 class DatabaseServer(Server):
     def __init__(self, directory=None):
@@ -29,6 +36,8 @@ class DatabaseServer(Server):
 
         self.mariadb_directory = "/var/lib/mysql"
         self.pt_stalk_directory = "/var/lib/pt-stalk"
+        self.audit_log_directory = "/var/log/mysql"
+        self.audit_log_pending_directory = os.path.join(self.audit_log_directory, "audit_pending")
 
         self.job = None
         self.step = None
@@ -222,6 +231,147 @@ WHERE `schema` IN (
         if not success:
             raise Exception(f"Failed to update schema size for {database}: {msg}")
 
+    @job("Check And Repair Database Tables")
+    def check_and_repair_tables_job(
+        self,
+        private_ip: str,
+        mariadb_root_password: str,
+        database: str,
+        tables: list[str] | None = None,
+    ):
+        check_result = self.check_database_tables(private_ip, mariadb_root_password, database, tables)
+        return self.repair_database_tables(
+            private_ip, mariadb_root_password, database, check_result["corrupted"]
+        )
+
+    @step("Check Database Tables")
+    def check_database_tables(  # noqa: C901
+        self, private_ip: str, mariadb_root_password: str, database: str, tables: list[str] | None = None
+    ):
+        db = Database(private_ip, self.db_port, "root", mariadb_root_password, database)
+        success, output = db.execute_query("SHOW TABLES;")
+        if not success:
+            raise Exception(f"Failed to fetch tables for {database}: {output}")
+        existing_tables = [x[0] for x in output[0].get("output").get("data")]
+
+        # Whitelist against tables that actually exist, so a caller-supplied `tables` list
+        # can't smuggle SQL through the unescaped identifiers used below.
+        if tables:
+            invalid_tables = [t for t in tables if t not in existing_tables]
+            tables = [t for t in tables if t in existing_tables]
+        else:
+            invalid_tables = []
+            tables = existing_tables
+
+        log = [f"Checking {len(tables)} table(s) in `{database}`."]
+        if invalid_tables:
+            log.append(f"Ignored {len(invalid_tables)} unknown table(s): {', '.join(invalid_tables)}")
+
+        corrupted = {}
+        batch_size = 50
+        for start in range(0, len(tables), batch_size):
+            batch = tables[start : start + batch_size]
+            query = "".join(f"CHECK TABLE `{table}`;\n" for table in batch)
+            success, output = db.execute_query(query, as_dict=True)
+            if not success:
+                raise Exception(f"Failed to check tables for {database}: {output}")
+            for table, result in zip(batch, output):
+                rows = result.get("output") or []
+                error_rows = [r for r in rows if (r.get("Msg_type") or "").lower() == "error"]
+                if error_rows:
+                    corrupted[table] = "; ".join(r.get("Msg_text", "") for r in error_rows)
+                    continue
+                row = rows[-1] if rows else {}
+                msg_type, msg_text = row.get("Msg_type"), row.get("Msg_text")
+                if msg_type == "status" and msg_text == "OK":
+                    continue
+                if (
+                    msg_type == "note"
+                    and msg_text == "The storage engine for the table doesn't support check"
+                ):
+                    continue
+                corrupted[table] = msg_text
+
+        if corrupted:
+            log.append(f"Found {len(corrupted)} corrupted table(s):")
+            log.extend(f"- `{table}`: {msg}" for table, msg in corrupted.items())
+        else:
+            log.append("No corrupted tables found.")
+
+        return {
+            "output": "\n".join(log),
+            "tables": tables,
+            "invalid_tables": invalid_tables,
+            "corrupted": corrupted,
+        }
+
+    @step("Repair Database Tables")
+    def repair_database_tables(  # noqa: C901
+        self, private_ip: str, mariadb_root_password: str, database: str, corrupted: dict
+    ):
+        if not corrupted:
+            return {"output": "No corrupted tables found. Nothing to repair."}
+
+        db = Database(private_ip, self.db_port, "root", mariadb_root_password, database)
+        # Fetch engines for the whole schema instead of interpolating table names into an
+        # `IN (...)` clause, so no caller-supplied value ever gets built into the query.
+        success, output = db.execute_query(
+            f"SELECT TABLE_NAME, ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA='{database}';",
+            as_dict=True,
+        )
+        if not success:
+            raise Exception(f"Failed to fetch table engines for {database}: {output}")
+        engines = {row["TABLE_NAME"]: row["ENGINE"] for row in output[0]["output"]}
+
+        repaired, failed, skipped = [], {}, []
+        for table in corrupted:
+            engine = engines.get(table)
+            if engine == "MyISAM":
+                query = f"REPAIR TABLE `{table}`;"
+            elif engine == "InnoDB":
+                query = f"OPTIMIZE TABLE `{table}`;"
+            else:
+                skipped.append(table)
+                continue
+
+            ran, output = db.execute_query(query, commit=True, as_dict=True)
+            if not ran:
+                failed[table] = str(output)
+                continue
+
+            # The statement can run without raising while still reporting failure in one of
+            # its result rows (e.g. Msg_type='error'), possibly followed by an unrelated
+            # status row, so every row must be checked instead of only the last one.
+            rows = output[0].get("output") or []
+            error_rows = [r for r in rows if (r.get("Msg_type") or "").lower() == "error"]
+            if error_rows:
+                failed[table] = "; ".join(r.get("Msg_text", "") for r in error_rows)
+                continue
+
+            row = rows[-1] if rows else {}
+            msg_type, msg_text = row.get("Msg_type"), row.get("Msg_text")
+            if msg_type == "status" and msg_text in ("OK", "Table is already up to date"):
+                repaired.append(table)
+            else:
+                failed[table] = msg_text or "Unknown error"
+
+        log = [f"Attempted to repair {len(corrupted)} corrupted table(s) in `{database}`."]
+        if repaired:
+            log.append(f"Repaired {len(repaired)} table(s): {', '.join(repaired)}")
+        if failed:
+            log.append(f"Failed to repair {len(failed)} table(s):")
+            log.extend(f"- `{table}`: {msg}" for table, msg in failed.items())
+        if skipped:
+            log.append(f"Skipped {len(skipped)} table(s) with unsupported engine: {', '.join(skipped)}")
+
+        return {
+            "output": "\n".join(log),
+            "corrupted": corrupted,
+            "repaired": repaired,
+            "failed": failed,
+            "skipped": skipped,
+        }
+
     @job("Flush Tables")
     def flush_tables_job(self, private_ip: str, mariadb_root_password: str):
         self.flush_tables(private_ip, mariadb_root_password)
@@ -322,7 +472,9 @@ WHERE `schema` IN (
                 MASTER_PORT = {master_db_port},
                 MASTER_USER = 'root',
                 MASTER_PASSWORD = '{master_mariadb_root_password}',
-                MASTER_USE_GTID=slave_pos;
+                MASTER_USE_GTID=slave_pos,
+                MASTER_SSL=0,
+                MASTER_SSL_VERIFY_SERVER_CERT=0;
             """)
             return {
                 "success": True,
@@ -880,6 +1032,151 @@ WHERE `schema` IN (
             "failed_uploads": failed_uploads,
         }
 
+    def get_audit_logs(self) -> dict:
+        return {
+            "rotated": list_audit_logs(self.audit_log_directory, AUDIT_LOG_ROTATED_RE),
+            "pending_upload": list_audit_logs(self.audit_log_pending_directory, AUDIT_LOG_STAGED_RE),
+        }
+
+    @job("Upload Audit Logs To S3", priority="low")
+    def upload_audit_logs_to_s3_job(self, private_ip: str, mariadb_root_password: str, offsite: dict) -> dict:
+        with self.audit_log_lock():
+            self.stage_audit_logs(private_ip, mariadb_root_password)
+            return self.upload_audit_logs_to_s3(offsite)
+
+    @contextlib.contextmanager
+    def audit_log_lock(self):
+        """Refuse overlapping runs, which would rotate and unlink under each other."""
+        os.makedirs(self.audit_log_pending_directory, exist_ok=True)
+        with open(os.path.join(self.audit_log_pending_directory, ".lock"), "w") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as e:
+                raise Exception("Another audit log upload is already running on this server") from e
+            try:
+                yield
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+    @step("Rotate Audit Log")
+    def stage_audit_logs(self, private_ip: str, mariadb_root_password: str) -> dict:
+        """Rotate the audit log and move the rotated files out of the plugin's namespace.
+
+        server_audit renames .1 to .2 and so on at every rotation, so names are only stable
+        between them. Rotations are frozen while the files are moved, and audit_log_lock
+        keeps a second run from rotating too.
+        """
+        mariadb = Database(private_ip, self.db_port, "root", mariadb_root_password, "mysql")
+        rotations = self.get_global(mariadb, "server_audit_file_rotations")
+        mariadb.execute_query("SET GLOBAL server_audit_file_rotate_now = 1;", commit=True)
+        # 0 means the plugin stops rotating, so the names can't move while we read them
+        mariadb.execute_query("SET GLOBAL server_audit_file_rotations = 0;", commit=True)
+        try:
+            staged = self.move_rotated_audit_logs_to_pending()
+        finally:
+            # Left at 0 the live log never rotates and grows past the disk cap
+            mariadb.execute_query(f"SET GLOBAL server_audit_file_rotations = {int(rotations)};", commit=True)
+
+        return {"staged_files": staged}
+
+    @staticmethod
+    def get_global(mariadb: Database, variable: str) -> int:
+        success, output = mariadb.execute_query(f"SELECT @@GLOBAL.{variable};")
+        if not success:
+            raise Exception(f"Failed to read {variable}: {output}")
+        return output[0]["output"]["data"][0][0]
+
+    def move_rotated_audit_logs_to_pending(self) -> list[str]:
+        os.makedirs(self.audit_log_pending_directory, exist_ok=True)
+        staged = []
+        for log in list_audit_logs(self.audit_log_directory, AUDIT_LOG_ROTATED_RE):
+            source = os.path.join(self.audit_log_directory, log["name"])
+            index = log["name"].rsplit(".", 1)[-1]
+            rotated_at = datetime.fromtimestamp(log["modified_at"]).strftime("%Y%m%d%H%M%S")
+            destination = os.path.join(
+                self.audit_log_pending_directory, f"server_audit_{rotated_at}_{index}.log"
+            )
+            # os.rename would clobber an existing destination silently; os.link refuses it
+            os.link(source, destination)
+            # Nothing can rotate here, but unlinking a rebound name loses a log for good
+            if os.stat(source).st_ino == os.stat(destination).st_ino:
+                os.unlink(source)
+            staged.append(os.path.basename(destination))
+
+        return staged
+
+    @step("Upload Audit Logs To S3")
+    def upload_audit_logs_to_s3(self, offsite: dict) -> dict:
+        """Upload every staged audit log, then delete it from disk.
+
+        Returns {"offsite_files": {name: {size, uncompressed_size, path,
+        start_timestamp, end_timestamp}}, "failed_uploads": {name: error}}. Press turns
+        each offsite_files entry into a MariaDB Audit Log record.
+        """
+        import boto3
+
+        offsite_files = {}
+        failed_uploads = {}
+
+        bucket, auth, prefix = (
+            offsite["bucket"],
+            offsite["auth"],
+            offsite["path"],
+        )
+        region = auth.get("REGION")
+
+        if region:
+            s3 = boto3.client(
+                "s3",
+                aws_access_key_id=auth["ACCESS_KEY"],
+                aws_secret_access_key=auth["SECRET_KEY"],
+                region_name=region,
+            )
+        else:
+            s3 = boto3.client(
+                "s3",
+                aws_access_key_id=auth["ACCESS_KEY"],
+                aws_secret_access_key=auth["SECRET_KEY"],
+            )
+
+        tmp_folder = get_tmp_folder_path()
+        for log in list_audit_logs(self.audit_log_pending_directory, AUDIT_LOG_STAGED_RE):
+            audit_log = log["name"]
+            audit_log_path = os.path.join(self.audit_log_pending_directory, audit_log)
+            audit_log_gz_path = os.path.join(tmp_folder, f"{audit_log}.gz")
+            offsite_path = os.path.join(prefix, f"{audit_log}.gz")
+            try:
+                start, end = parse_audit_log_time_range(audit_log_path)
+                if not start:
+                    # Nothing was audited in this window. Don't bill for an empty object.
+                    os.remove(audit_log_path)
+                    continue
+
+                cmd = f"gzip -c {audit_log_path} > {audit_log_gz_path}"
+                subprocess.run(cmd, shell=True, check=True)
+                gzipped_size = os.path.getsize(audit_log_gz_path)
+                with open(audit_log_gz_path, "rb") as f:
+                    s3.upload_fileobj(f, bucket, offsite_path)
+                offsite_files[audit_log] = {
+                    "size": gzipped_size,
+                    "uncompressed_size": log["size"],
+                    "path": offsite_path,
+                    "start_timestamp": start,
+                    "end_timestamp": end,
+                }
+                # Unlike binlogs, nothing else reclaims this disk space for us
+                os.remove(audit_log_path)
+            except Exception as e:
+                failed_uploads[audit_log] = str(e)
+            finally:
+                with contextlib.suppress(Exception):
+                    os.remove(audit_log_gz_path)
+
+        return {
+            "offsite_files": offsite_files,
+            "failed_uploads": failed_uploads,
+        }
+
     def _get_current_binlog(self) -> str | None:
         index_file = Path(self.mariadb_directory) / "mysql-bin.index"
         if index_file.exists():
@@ -948,3 +1245,39 @@ def get_tmp_folder_path():
     if not os.path.exists(path):
         return "/tmp/"
     return path
+
+
+def list_audit_logs(directory: str, pattern: re.Pattern) -> list[dict]:
+    path = Path(directory)
+    if not path.exists():
+        return []
+
+    logs = []
+    for file in path.iterdir():
+        if not pattern.match(file.name):
+            continue
+        stat = file.stat()
+        logs.append({"name": file.name, "size": stat.st_size, "modified_at": stat.st_mtime})
+
+    return sorted(logs, key=lambda log: log["name"])
+
+
+def parse_audit_log_time_range(path: str) -> tuple[str | None, str | None]:
+    """Return the timestamps of the first and last record in a server_audit log.
+
+    Press shows this as the window the file covers, so it has to come from the records
+    themselves rather than the file's mtime.
+    """
+    start = end = None
+    with open(path, errors="replace") as f:
+        for line in f:
+            # Queries can contain newlines, so match the record prefix instead of
+            # assuming one record per line.
+            if not AUDIT_LOG_RECORD_RE.match(line):
+                continue
+            timestamp = datetime.strptime(line[:17], "%Y%m%d %H:%M:%S").isoformat()
+            if start is None:
+                start = timestamp
+            end = timestamp
+
+    return start, end

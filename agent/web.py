@@ -16,6 +16,7 @@ from rq.exceptions import NoSuchJobError
 from rq.job import Job as RQJob
 from rq.job import JobStatus
 
+from agent.backup_log import InvalidRange, parse_range
 from agent.base import AgentException
 from agent.builder import ImageBuilder, PatchImageBuilder
 from agent.database import JSONEncoderForSQLQueryResult
@@ -212,6 +213,7 @@ def build_image():
         build_name=data.get("deploy_candidate_build"),
         deploy_candidate_params=data.get("deploy_candidate_params"),
         ssh_keys=data.get("ssh_keys"),
+        asset_store=data.get("asset_store"),
     )
     job = image_builder.run_remote_builder()
     return {"job": job}
@@ -346,6 +348,7 @@ def update_nginx_ip_access():
     job = Server().update_nginx_access(
         ip_accept=data.get("ip_accept", []),
         ip_drop=data.get("ip_drop", []),
+        proxy_ip=data.get("proxy_ip"),
     )
     return {"job": job}
 
@@ -607,6 +610,7 @@ def new_site_from_backup(bench):
             data.get("public"),
             data.get("private"),
             data.get("skip_failing_patches", False),
+            data.get("skip_migrate", False),
         )
     )
     return {"job": job}
@@ -744,7 +748,8 @@ def fetch_site_status(bench, site):
 @application.route("/benches/<string:bench>/sites/<string:site>/info", methods=["GET"])
 @validate_bench_and_site
 def fetch_site_info(bench, site):
-    return {"data": Server().benches[bench].sites[site].fetch_site_info()}
+    database_only = request.args.get("database_only") in ("1", "true", "True")
+    return {"data": Server().benches[bench].sites[site].fetch_site_info(database_only=database_only)}
 
 
 @application.route("/benches/<string:bench>/sites/<string:site>/analytics", methods=["GET"])
@@ -768,6 +773,13 @@ def backup_site(bench, site):
         .sites[site]
         .backup_job(with_files, offsite, keep_files_locally_after_offsite_backup, stream)
     )
+    return {"job": job}
+
+
+@application.route("/benches/<string:bench>/sites/<string:site>/fix_global_search", methods=["POST"])
+@validate_bench_and_site
+def fix_global_search(bench, site):
+    job = Server().benches[bench].sites[site].fix_global_search()
     return {"job": job}
 
 
@@ -1356,6 +1368,18 @@ def refresh_database_usage():
     return {"job": job}
 
 
+@application.route("/database/check-and-repair-tables", methods=["POST"])
+def check_and_repair_tables():
+    data = request.json
+    job = DatabaseServer().check_and_repair_tables_job(
+        private_ip=data["private_ip"],
+        mariadb_root_password=data["mariadb_root_password"],
+        database=data["database"],
+        tables=data.get("tables"),
+    )
+    return {"job": job}
+
+
 @application.route("/database/binary/logs")
 def get_binary_logs():
     return jsonify(DatabaseServer().binary_logs)
@@ -1438,6 +1462,18 @@ def get_binlogs():
 def upload_binlogs_to_s3():
     data = request.json
     job = DatabaseServer().upload_binlogs_to_s3_job(**data)
+    return {"job": job}
+
+
+@application.route("/database/audit-logs/list", methods=["GET"])
+def get_audit_logs():
+    return jsonify(DatabaseServer().get_audit_logs())
+
+
+@application.route("/database/audit-logs/upload", methods=["POST"])
+def upload_audit_logs_to_s3():
+    data = request.json
+    job = DatabaseServer().upload_audit_logs_to_s3_job(**data)
     return {"job": job}
 
 
@@ -1649,6 +1685,27 @@ def jobs(id=None, ids=None, status=None):
         data = get_jobs(limit=100)
 
     return jsonify(json.loads(json.dumps(data, default=str)))
+
+
+@application.route("/server/backup-jobs", methods=["POST"])
+def fetch_backup_jobs():
+    """Queue a read of the job database for one site's backups, for an audit of a past date.
+
+    Scoped to the named site and a bounded date range, so it cannot be used to walk the
+    whole job database or read another site's runs. The range is checked here so a bad
+    one is a failed request rather than a failed job.
+    """
+    site = request.args.get("site")
+    if not site:
+        return jsonify({"message": "site is required"}), 400
+
+    try:
+        parse_range(request.args.get("start"), request.args.get("end"))
+    except InvalidRange as e:
+        return jsonify({"message": str(e)}), 400
+
+    job = Server().fetch_backup_jobs(site, request.args.get("start"), request.args.get("end"))
+    return {"job": job}
 
 
 @application.route("/jobs/<int:id>/cancel", methods=["POST"])

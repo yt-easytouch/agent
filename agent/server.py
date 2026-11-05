@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import ipaddress
 import json
 import os
 import platform
@@ -34,6 +35,28 @@ from agent.site import Site
 from agent.utils import get_supervisor_processes_status, is_registry_healthy
 
 
+def is_ip_network(value: object) -> bool:
+    """Whether the value is an IP address or CIDR that nginx will accept."""
+    if not isinstance(value, str):
+        return False
+    try:
+        ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        return False
+    return True
+
+
+def validate_ip_sources(ip_accept: list[str], ip_drop: list[str], proxy_ip: str | None) -> None:
+    """Nginx renders these raw, so one bad value breaks every reload that follows."""
+    sources = [*ip_accept, *ip_drop]
+    if proxy_ip:
+        sources.append(proxy_ip)
+
+    for source in sources:
+        if not is_ip_network(source):
+            raise AgentException({"error": f"{source!r} is not a valid IP address or CIDR."})
+
+
 class Server(Base):
     def __init__(self, directory=None):
         super().__init__()
@@ -53,10 +76,15 @@ class Server(Base):
         self.nginx_directory = self.config["nginx_directory"]
         self.hosts_directory = os.path.join(self.nginx_directory, "hosts")
         self.error_pages_directory = os.path.join(self.directory, "repo", "agent", "pages")
+        self.dhparam_file = os.path.join(self.directory, "repo", "agent", "tls", "ffdhe2048.pem")
 
     @property
     def press_url(self):
         return self.config.get("press_url", "https://frappecloud.com")
+
+    @property
+    def backup_workers(self) -> int:
+        return self.config.get("backup_workers", 1)
 
     def docker_login(self, registry):
         url = shlex.quote(registry["url"])
@@ -222,6 +250,17 @@ class Server(Base):
 
             self.disable_production_on_bench(bench_name)
             self._move_bench_to_archived_directory(bench_name)
+
+    @job("Fetch Backup Jobs")
+    def fetch_backup_jobs(self, site: str, start: str, end: str):
+        return self._fetch_backup_jobs(site, start, end)
+
+    @step("Fetch Backup Jobs")
+    def _fetch_backup_jobs(self, site: str, start: str, end: str):
+        """Walking the job database can take seconds, so it runs here and not in a worker."""
+        from agent.backup_log import get_backup_jobs
+
+        return get_backup_jobs(site, start, end)
 
     @job("Push Images to Registry")
     def push_images_to_registry(self, images: list[str], registry_settings: dict[str, str]) -> None:
@@ -526,7 +565,7 @@ class Server(Base):
 
         target = Bench(target, self)
         self.move_site(site, target)
-        source.setup_nginx()
+        source.setup_nginx(ignore_missing_site_configs=True)
         target.setup_nginx_target()
         self.reload_nginx()
 
@@ -565,7 +604,7 @@ class Server(Base):
         target = Bench(target, self)
         self.move_site(site, target)
 
-        source.setup_nginx()
+        source.setup_nginx(ignore_missing_site_configs=True)
         target.setup_nginx_target()
         self.reload_nginx()
 
@@ -780,15 +819,22 @@ class Server(Base):
         )
 
     @job("Update NGINX IP access")
-    def update_nginx_access(self, ip_accept: list[str], ip_drop: list[str]):
-        self.update_config_ip(ip_accept, ip_drop)
+    def update_nginx_access(self, ip_accept: list[str], ip_drop: list[str], proxy_ip: str | None = None):
+        self.update_config_ip(ip_accept, ip_drop, proxy_ip)
         self.update_agent_nginx_config()
         self.reload_nginx()
 
     @step("Update config IP access")
-    def update_config_ip(self, ip_accept: list[str], ip_drop: list[str]):
+    def update_config_ip(self, ip_accept: list[str], ip_drop: list[str], proxy_ip: str | None = None):
+        # Reject before the lock is taken, so a bad value leaves the server on
+        # the config it already had.
+        validate_ip_sources(ip_accept, ip_drop, proxy_ip)
+
         config = self.get_config(for_update=True)
         config.update({"ip_accept": ip_accept, "ip_drop": ip_drop})
+        # Without it nginx matches the proxy's own address and every rule passes.
+        if proxy_ip:
+            config["proxy_ip"] = proxy_ip
         self.set_config(config, indent=4)
 
     def update_config(self, value):
@@ -888,13 +934,19 @@ class Server(Base):
 
         self._generate_redis_config()
         self._generate_supervisor_config()
-        self.execute("sudo supervisorctl reread")
+        # reread alone loads the new config without acting on it; update is what
+        # actually adds and starts programs that are new in the template.
+        self._update_supervisor()
         self.execute("sudo supervisorctl restart agent:redis")
 
         self.setup_nginx()
         for worker in range(self.config["workers"]):
             worker_name = f"agent:worker-{worker}"
             self.execute(f"sudo supervisorctl restart {worker_name}")
+
+        for worker in range(self.backup_workers):
+            worker_name = f"agent:worker_backup-{worker}"
+            self.execute(f"sudo supervisorctl restart {worker_name}", non_zero_throw=False)
 
         self.execute("sudo supervisorctl restart agent:web")
         run_patches()
@@ -923,11 +975,12 @@ class Server(Base):
 
         # Stop required services
         if restart_rq_workers:
-            for worker_id in supervisor_status.get("worker", {}):
-                self.execute(
-                    f"sudo supervisorctl stop agent:worker-{worker_id}",
-                    non_zero_throw=False,
-                )
+            for group in ("worker", "worker_backup"):
+                for worker_id in supervisor_status.get(group, {}):
+                    self.execute(
+                        f"sudo supervisorctl stop agent:{group}-{worker_id}",
+                        non_zero_throw=False,
+                    )
 
         # Stop NGINX Reload Manager if it's a proxy server
         is_proxy_server = (
@@ -965,6 +1018,8 @@ class Server(Base):
         if restart_rq_workers:
             for i in range(self.config["workers"]):
                 self.execute(f"sudo supervisorctl start agent:worker-{i}")
+            for i in range(self.backup_workers):
+                self.execute(f"sudo supervisorctl start agent:worker_backup-{i}", non_zero_throw=False)
 
         if restart_web_workers:
             self.execute("sudo supervisorctl start agent:web")
@@ -1178,7 +1233,8 @@ class Server(Base):
             {
                 "proxy_ip": self.config.get("proxy_ip"),
                 "tls_protocols": self.config.get("tls_protocols"),
-                "nginx_vts_module_enabled": self.config.get("nginx_vts_module_enabled", True),
+                "dhparam_file": self.dhparam_file,
+                "nginx_vts_module_enabled": self.config.get("nginx_vts_module_enabled", False),
                 "ip_whitelist": self.config.get("ip_whitelist", []),
                 "conf_directory": os.path.join(self.config.get("benches_directory"), "*", "nginx.conf"),
                 "ip_accept": self.config.get("ip_accept", []),
@@ -1201,7 +1257,7 @@ class Server(Base):
                 "trace": self.config.get("trace", False),
                 "tls_directory": self.config["tls_directory"],
                 "nginx_directory": self.nginx_directory,
-                "nginx_vts_module_enabled": self.config.get("nginx_vts_module_enabled", True),
+                "nginx_vts_module_enabled": self.config.get("nginx_vts_module_enabled", False),
                 "pages_directory": os.path.join(self.directory, "repo", "agent", "pages"),
                 "tls_protocols": self.config.get("tls_protocols"),
                 "press_url": self.config.get("press_url"),
@@ -1224,6 +1280,7 @@ class Server(Base):
             "redis_port": self.config["redis_port"],
             "gunicorn_workers": self.config.get("gunicorn_workers", 2),
             "workers": self.config["workers"],
+            "backup_workers": self.backup_workers,
             "directory": self.directory,
             "user": self.config["user"],
             "sentry_dsn": self.config.get("sentry_dsn"),
