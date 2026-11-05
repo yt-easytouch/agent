@@ -1037,8 +1037,14 @@ class Bench(Base):
 
         if build_assets:
             self.rebuild([app])
+            self.sync_app_assets(app)
 
         self.restart()
+
+    @step("Sync App Assets")
+    def sync_app_assets(self, app: str):
+        # bench build copies sites/assets before the app's own build command writes new files
+        return self.docker_execute(f"cp -a apps/{app}/{app}/public/. sites/assets/{app}/")
 
     def prepare_app_patch(self, app: str, patch: str, filename: str) -> str:
         """
