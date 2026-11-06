@@ -1043,8 +1043,11 @@ class Bench(Base):
 
     @step("Sync App Assets")
     def sync_app_assets(self, app: str):
-        # bench build copies sites/assets before the app's own build command writes new files
-        return self.docker_execute(f"cp -a apps/{app}/{app}/public/. sites/assets/{app}/")
+        # bench build copies sites/assets before the app's own build command writes new files.
+        # node_modules is a symlink in public/ but a folder in sites/assets, so cp cannot copy it.
+        public = f"apps/{app}/{app}/public"
+        copy = f"tar -C {public} --exclude=./node_modules -cf - . | tar -C sites/assets/{app} -xf -"
+        return self.docker_execute(f"sh -c '{copy}'")
 
     def prepare_app_patch(self, app: str, patch: str, filename: str) -> str:
         """

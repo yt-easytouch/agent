@@ -40,11 +40,14 @@ class TestPatchApp(unittest.TestCase):
         bench.sync_app_assets.assert_not_called()
         bench.restart.assert_called_once()
 
-    def test_sync_app_assets_copies_the_app_public_folder_into_sites_assets(self):
+    def test_sync_app_assets_copies_the_app_public_folder_into_sites_assets_without_node_modules(self):
         bench = object.__new__(Bench)
         bench.docker_execute = MagicMock()
         Bench.sync_app_assets.__wrapped__(bench, "qorshe")
-        bench.docker_execute.assert_called_once_with("cp -a apps/qorshe/qorshe/public/. sites/assets/qorshe/")
+        bench.docker_execute.assert_called_once_with(
+            "sh -c 'tar -C apps/qorshe/qorshe/public --exclude=./node_modules -cf - . "
+            "| tar -C sites/assets/qorshe -xf -'"
+        )
 
 
 if __name__ == "__main__":
